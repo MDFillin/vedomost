@@ -54,6 +54,14 @@ CREATE TABLE IF NOT EXISTS extra_dates (
 CREATE TABLE IF NOT EXISTS skip_dates (
     date TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS sick_leaves (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    start       TEXT NOT NULL,          -- YYYY-MM-DD, включительно
+    end         TEXT NOT NULL,          -- YYYY-MM-DD, включительно
+    created_at  TEXT NOT NULL,
+    by_admin    INTEGER NOT NULL DEFAULT 0
+);
 """
 
 DEFAULT_MESSAGE_TEXT = "📅 {день}, {дата} {время}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇"
@@ -77,6 +85,9 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "members_only": "1",     # отмечаться могут только участники чата группы
     "roster_only": "0",      # отмечаться могут только студенты из списка
     "protect_content": "1",  # запрет пересылки и копирования сообщения
+    "sick_button": "1",      # показывать кнопку «Я болею»
+    "sick_button_text": "😷 Я болею",
+    "notify_sick": "1",      # сообщать старосте о новых больничных
 }
 
 
@@ -115,6 +126,19 @@ class Session:
     created_at: str
     close_at: str | None
     closed: bool
+
+
+@dataclass
+class SickLeave:
+    id: int
+    user_id: int
+    start: str
+    end: str
+    created_at: str
+    by_admin: bool
+
+    def covers(self, day: str) -> bool:
+        return self.start <= day <= self.end
 
 
 @dataclass
@@ -265,6 +289,7 @@ class Database:
 
     def delete_student(self, user_id: int) -> None:
         self.conn.execute("DELETE FROM attendance WHERE user_id = ?", (user_id,))
+        self.conn.execute("DELETE FROM sick_leaves WHERE user_id = ?", (user_id,))
         self.conn.execute("DELETE FROM students WHERE user_id = ?", (user_id,))
         self.conn.commit()
 
@@ -446,3 +471,55 @@ class Database:
             self.conn.execute("SELECT 1 FROM skip_dates WHERE date = ?", (date,)).fetchone()
             is not None
         )
+
+    # ---------- больничные ----------
+    @staticmethod
+    def _sick(row: sqlite3.Row) -> SickLeave:
+        return SickLeave(
+            id=row["id"],
+            user_id=row["user_id"],
+            start=row["start"],
+            end=row["end"],
+            created_at=row["created_at"],
+            by_admin=bool(row["by_admin"]),
+        )
+
+    def add_sick_leave(self, user_id: int, start: str, end: str, by_admin: bool = False) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO sick_leaves(user_id, start, end, created_at, by_admin) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, start, end, utcnow().isoformat(), int(by_admin)),
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def get_sick_leave(self, leave_id: int) -> SickLeave | None:
+        row = self.conn.execute("SELECT * FROM sick_leaves WHERE id = ?", (leave_id,)).fetchone()
+        return self._sick(row) if row else None
+
+    def list_sick_leaves(self, user_id: int | None = None, since: str | None = None) -> list[SickLeave]:
+        sql, args = "SELECT * FROM sick_leaves WHERE 1 = 1", []
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            args.append(user_id)
+        if since is not None:
+            sql += " AND end >= ?"
+            args.append(since)
+        sql += " ORDER BY start DESC, id DESC"
+        return [self._sick(r) for r in self.conn.execute(sql, args)]
+
+    def delete_sick_leave(self, leave_id: int) -> None:
+        self.conn.execute("DELETE FROM sick_leaves WHERE id = ?", (leave_id,))
+        self.conn.commit()
+
+    def sick_on(self, day: str) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT user_id FROM sick_leaves WHERE start <= ? AND end >= ?", (day, day)
+        )
+        return {r["user_id"] for r in rows}
+
+    def sick_days_by_user(self) -> dict[int, list[SickLeave]]:
+        result: dict[int, list[SickLeave]] = {}
+        for leave in self.list_sick_leaves():
+            result.setdefault(leave.user_id, []).append(leave)
+        return result

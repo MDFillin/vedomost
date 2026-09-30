@@ -15,6 +15,7 @@ from aiogram.methods import (
     GetChatAdministrators,
     GetChatMember,
     GetChatMemberCount,
+    GetMe,
     SendDocument,
     SendMessage,
     TelegramMethod,
@@ -33,7 +34,7 @@ from aiogram.types import (
 
 from bot.config import Config
 from bot.db import Database
-from bot.handlers import admin, group
+from bot.handlers import admin, group, sick
 from bot import members
 from bot.service import compute_close_at, due_slots, next_slot, send_session
 from bot.utils import get_tz, parse_date, parse_times
@@ -71,6 +72,8 @@ class FakeSession(BaseSession):
             return [ChatMemberOwner(user=user(ADMIN), is_anonymous=False)]
         if isinstance(method, GetChatMemberCount):
             return 31
+        if isinstance(method, GetMe):
+            return User(id=42, is_bot=True, first_name="Ведомость", username="vedomost_bot")
         return True
 
     async def close(self) -> None:
@@ -91,7 +94,7 @@ def env():
     session = FakeSession()
     bot = Bot("42:TEST", session=session, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(storage=MemoryStorage(), db=db, config=config)
-    routers = [group.router, *admin.setup(config)]
+    routers = [group.router, sick.router, *admin.setup(config)]
     for r in routers:
         dp.include_router(r)
     members._member_cache.clear()
@@ -186,7 +189,7 @@ async def test_full_flow(env):
     s = await send_session(bot, db, date.today(), "10:00", slot="x")
     group_msg = session.of(SendMessage)[-1]
     assert group_msg.chat_id == GROUP
-    assert buttons(group_msg) == [f"mark:{s.id}"]
+    assert buttons(group_msg) == [f"mark:{s.id}", f"sick:{s.id}"]
     assert group_msg.reply_markup.inline_keyboard[0][0].style == "success"
     for uid, name in STUDENTS:
         await press(dp, bot, uid, "register", GROUP, name)
@@ -481,3 +484,110 @@ async def test_member_join_leave_without_api(env):
                   left_chat_member=newbie)
     await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
     assert not db.get_student(301).counted
+
+
+# ---------- больничный ----------
+
+async def test_sick_leave_flow(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    for uid, name in STUDENTS:
+        db.upsert_student(uid, name, None)
+    today = date.today()
+    s = await send_session(bot, db, today, "10:00")
+
+    # кнопка в группе открывает личку с ботом
+    await press(dp, bot, 202, f"sick:{s.id}", GROUP, "Пётр Петров")
+    assert session.of(AnswerCallbackQuery)[-1].url == "https://t.me/vedomost_bot?start=sick"
+    # посторонний не может
+    await press(dp, bot, OUTSIDER, f"sick:{s.id}", GROUP, "Чужой Человек")
+    assert "только участники" in last_alert(session)
+
+    # в личке: /start sick → календарь → первый и последний день → сохранить
+    await text(dp, bot, 202, "/start sick")
+    cal = session.of(SendMessage)[-1]
+    assert "первый день" in cal.text
+    assert f"sk:d:{today.isoformat()}" in buttons(cal)
+    start, end = today - timedelta(days=1), today + timedelta(days=2)
+    await press(dp, bot, 202, f"sk:d:{start.isoformat()}", 202, "Пётр Петров")
+    step2 = session.of(EditMessageText)[-1]
+    assert "последний день" in step2.text
+    assert f"sk:d:{(start - timedelta(days=1)).isoformat()}" not in buttons(step2)
+    await press(dp, bot, 202, f"sk:d:{end.isoformat()}", 202, "Пётр Петров")
+    assert "(4 дн.)" in session.of(EditMessageText)[-1].text
+    await press(dp, bot, 202, "sk:save", 202, "Пётр Петров")
+    assert "записан" in session.of(EditMessageText)[-1].text
+    [leave] = db.list_sick_leaves(202)
+    assert (leave.start, leave.end, leave.by_admin) == (start.isoformat(), end.isoformat(), False)
+
+    # старосте пришло уведомление, а в группе — счётчик болеющих
+    assert any("на больничном" in m.text for m in session.of(SendMessage) if m.chat_id == ADMIN)
+    assert "На больничном: <b>1</b>" in [e for e in session.of(EditMessageText)
+                                         if e.chat_id == GROUP][-1].text
+
+    # в карточке занятия: отдельный список болеющих
+    await press(dp, bot, ADMIN, f"a:s:{s.id}", ADMIN)
+    card = session.of(EditMessageText)[-1].text
+    assert "На больничном: 1" in card and "Не было без причины: 2" in card
+
+    # итоговая таблица
+    await press(dp, bot, ADMIN, "a:csv", ADMIN)
+    csv_bytes = session.of(SendDocument)[-1].document.data.decode("utf-8-sig")
+    row = next(line for line in csv_bytes.splitlines() if line.startswith("Пётр Петров;"))
+    assert row.split(";")[1] == "б"
+    assert "Больничные" in csv_bytes and "сам студент" in csv_bytes
+
+    # студент видит свои больничные и может удалить
+    await press(dp, bot, 202, "sk:my", 202, "Пётр Петров")
+    assert f"sk:del:{leave.id}" in buttons(session.of(EditMessageText)[-1])
+    await press(dp, bot, 202, f"sk:del:{leave.id}", 202, "Пётр Петров")
+    assert not db.list_sick_leaves(202)
+
+
+async def test_sick_leave_typed_and_by_admin(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    db.upsert_student(201, "Иван Иванов", None)
+    today = date.today()
+
+    # даты текстом
+    await press(dp, bot, 201, "sk:new", 201, "Иван Иванов")
+    a, b = today - timedelta(days=3), today
+    await text(dp, bot, 201, f"с {a:%d.%m} по {b:%d.%m}")
+    assert "(4 дн.)" in session.of(SendMessage)[-1].text
+    await press(dp, bot, 201, "sk:save", 201, "Иван Иванов")
+    assert db.list_sick_leaves(201)[0].start == a.isoformat()
+
+    # чужой больничный удалить нельзя
+    await press(dp, bot, 203, f"sk:del:{db.list_sick_leaves(201)[0].id}", 203, "Анна")
+    assert db.list_sick_leaves(201)
+
+    # староста добавляет больничный за студента из его карточки
+    await press(dp, bot, ADMIN, "sk:for:201", ADMIN)
+    await press(dp, bot, ADMIN, f"sk:d:{today.isoformat()}", ADMIN)
+    await press(dp, bot, ADMIN, f"sk:d:{today.isoformat()}", ADMIN)
+    await press(dp, bot, ADMIN, "sk:save", ADMIN)
+    assert any(lv.by_admin for lv in db.list_sick_leaves(201))
+
+    # раздел «Больничные» у старосты и удаление
+    await press(dp, bot, ADMIN, "a:sick", ADMIN)
+    dels = [d for d in buttons(session.of(EditMessageText)[-1]) if d.startswith("a:sickdel:")]
+    assert len(dels) == 2
+    for d in dels:
+        await press(dp, bot, ADMIN, d, ADMIN)
+    assert not db.list_sick_leaves()
+
+    # не-старосте нельзя добавлять за других
+    await press(dp, bot, 203, "sk:for:201", 203, "Анна")
+    assert not db.list_sick_leaves()
+
+    # кнопку можно выключить
+    await press(dp, bot, ADMIN, "a:sett:sick_button", ADMIN)
+    s = await send_session(bot, db, today, "12:00")
+    assert buttons(session.of(SendMessage)[-1]) == [f"mark:{s.id}"]
+
+
+async def test_student_start_menu(env):
+    db, bot, dp, session = env
+    await text(dp, bot, 201, "/start")
+    assert buttons(session.of(SendMessage)[-1]) == ["sk:new", "sk:my"]

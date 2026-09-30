@@ -75,6 +75,9 @@ def group_text(db: Database, session: Session) -> str:
         status.append("🔒 Отметка закрыта")
     if db.get_bool("show_count") or db.get_bool("show_names") or not opened:
         status.append(f"👥 Отметились: <b>{len(marks)}</b>")
+        sick = len(db.sick_on(session.date) - set(marks)) if session.id else 0
+        if sick and db.get_bool("sick_button"):
+            status.append(f"😷 На больничном: <b>{sick}</b>")
     if status:
         lines.append("\n".join(status))
 
@@ -109,15 +112,22 @@ def preview_text(db: Database) -> str:
 def group_keyboard(db: Database, session: Session) -> InlineKeyboardMarkup | None:
     if not is_open(db, session):
         return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
+    rows = [[
+        InlineKeyboardButton(
+            text=db.get("button_text") or "✅ Я был",
+            callback_data=f"mark:{session.id}",
+            style=ButtonStyle.SUCCESS,
+        )
+    ]]
+    if db.get_bool("sick_button"):
+        rows.append([
             InlineKeyboardButton(
-                text=db.get("button_text") or "✅ Я был",
-                callback_data=f"mark:{session.id}",
-                style=ButtonStyle.SUCCESS,
+                text=db.get("sick_button_text") or "😷 Я болею",
+                callback_data=f"sick:{session.id}",
+                style=ButtonStyle.PRIMARY,
             )
-        ]]
-    )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ---------- отправка / обновление / закрытие ----------
@@ -264,14 +274,30 @@ class RefreshDebouncer:
         await refresh_group_message(bot, db, session_id)
 
 
-def attendance_summary(db: Database, session: Session) -> tuple[list[str], list[str]]:
-    """Списки имён присутствовавших и отсутствовавших."""
+def attendance_summary(
+    db: Database, session: Session
+) -> tuple[list[str], list[str], list[str]]:
+    """Имена присутствовавших, болеющих и отсутствовавших без причины."""
     fmt = db.get("name_format")
     marks = db.marks(session.id)
-    present, absent = [], []
+    sick = db.sick_on(session.date)
+    present, ill, absent = [], [], []
     for st in db.list_students():
-        (present if st.user_id in marks else absent).append(student_name(st, fmt))
-    return present, absent
+        name = student_name(st, fmt)
+        if st.user_id in marks:
+            present.append(name)
+        elif st.user_id in sick:
+            ill.append(name)
+        else:
+            absent.append(name)
+    return present, ill, absent
+
+
+async def refresh_sessions_on(bot: Bot, db: Database, days: set[str]) -> None:
+    """Обновляет сообщения открытых отметок за указанные дни (например, после больничного)."""
+    for s in db.list_sessions(limit=20):
+        if s.date in days and is_open(db, s):
+            await refresh_group_message(bot, db, s.id)
 
 
 async def close_session(
@@ -280,12 +306,14 @@ async def close_session(
     db.set_session_closed(session.id, True, None)
     await refresh_group_message(bot, db, session.id)
     if admin_ids and db.get_bool("notify_on_close"):
-        present, absent = attendance_summary(db, session)
-        total = len(present) + len(absent)
+        present, ill, absent = attendance_summary(db, session)
+        total = len(present) + len(ill) + len(absent)
         when = fmt_date(session.date, with_weekday=True)
         if session.time:
             when += f" {session.time}"
         text = [f"🔒 Отметка за <b>{when}</b> закрыта.", f"✅ Были: {len(present)}/{total}"]
+        if ill:
+            text.append("😷 Болеют: " + ", ".join(esc(n) for n in ill))
         if absent:
             text.append("❌ Не было: " + ", ".join(esc(n) for n in absent))
         await notify_admins(bot, admin_ids, "\n".join(text))

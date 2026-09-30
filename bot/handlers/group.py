@@ -202,6 +202,19 @@ async def on_mark(callback: CallbackQuery, bot: Bot, db: Database) -> None:
         await callback.answer("Вы уже отметились ✅\nПовторно нажимать не нужно.", show_alert=True)
 
 
+@router.callback_query(F.data.startswith("sick:"))
+async def on_sick(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    """«Я болею»: открываем личку с ботом, там человек выберет даты больничного."""
+    session = db.get_session(int(callback.data.split(":")[1]))
+    chat_id = session.chat_id if session else db.group_chat_id
+    denied = await check_access(callback, bot, db, chat_id) if chat_id else "Группа не привязана."
+    if denied:
+        await callback.answer(denied, show_alert=True)
+        return
+    me = await bot.me()
+    await callback.answer(url=f"https://t.me/{me.username}?start=sick")
+
+
 @router.callback_query(F.data == "register")
 async def on_register(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     chat_id = db.group_chat_id

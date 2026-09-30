@@ -9,7 +9,7 @@ from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandSc
 
 from .config import load_config
 from .db import Database
-from .handlers import admin, group
+from .handlers import admin, group, sick
 from .scheduler import run_scheduler
 
 
@@ -23,6 +23,7 @@ async def main() -> None:
     bot = Bot(config.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage(), db=db, config=config)
     dp.include_router(group.router)
+    dp.include_router(sick.router)
     for r in admin.setup(config):
         dp.include_router(r)
 
