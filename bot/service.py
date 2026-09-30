@@ -9,7 +9,8 @@ from aiogram.enums import ButtonStyle
 from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .db import Database, Session
+from .db import DEFAULT_BUTTON_TEXT, Database, Session, Student
+from .stats import ABSENT, PRESENT, SICK, session_statuses
 from .utils import (
     WEEKDAYS_FULL,
     esc,
@@ -76,35 +77,46 @@ def group_text(db: Database, session: Session) -> str:
     if body:
         lines += [body]
 
-    marks = db.marks(session.id)
     opened = is_open(db, session)
     status = []
     if opened:
         if session.close_at:
-            status.append(f"⏳ Отметка открыта до {to_local(db, session.close_at):%H:%M}")
+            status.append(f"⏳ Отметиться можно до {to_local(db, session.close_at):%H:%M}")
     else:
         status.append("🔒 Отметка закрыта")
+
+    absent, sick = who_is_missing(db, session)
+    fmt = db.get("name_format")
     if db.get_bool("show_count") or db.get_bool("show_names") or not opened:
-        status.append(f"👥 Отметились: <b>{len(marks)}</b>")
-        sick = len(db.sick_on(session.date) - set(marks)) if session.id else 0
-        if sick and db.get_bool("sick_button"):
-            status.append(f"😷 На больничном: <b>{sick}</b>")
+        status.append(f"🚫 Пропускают: <b>{len(absent)}</b>")
+        if sick:
+            status.append(f"😷 На больничном: <b>{len(sick)}</b>")
     if status:
         lines.append("\n".join(status))
 
-    if db.get_bool("show_names") and marks:
-        fmt = db.get("name_format")
-        names = []
-        for uid in marks:
-            st = db.get_student(uid)
-            names.append(esc(student_name(st, fmt)) if st else str(uid))
-        names.sort(key=str.lower)
+    if db.get_bool("show_names") and (absent or sick):
+        names = sorted(esc(student_name(st, fmt)) for st in absent)
+        names += sorted(f"{esc(student_name(st, fmt))} 😷" for st in sick)
         lines.append("\n".join(f"{i}. {n}" for i, n in enumerate(names, 1)))
 
     text = "\n\n".join(lines)
     if len(text) > 4000:
         text = text[:3990] + "\n…"
     return text
+
+
+def who_is_missing(db: Database, session: Session) -> tuple[list[Student], list[Student]]:
+    """Студенты, которые пропускают (без больничного) и которые болеют."""
+    if not session.id:
+        return [], []
+    students = {st.user_id: st for st in db.list_students()}
+    for uid in db.absences(session.id):  # нажавшие, но не попавшие в список (редкость)
+        if uid not in students and (st := db.get_student(uid)) and st.active:
+            students[uid] = st
+    statuses = session_statuses(db, session, list(students))
+    absent = [students[u] for u, v in statuses.items() if v == ABSENT]
+    sick = [students[u] for u, v in statuses.items() if v == SICK]
+    return absent, sick
 
 
 def preview_text(db: Database) -> str:
@@ -125,9 +137,9 @@ def group_keyboard(db: Database, session: Session) -> InlineKeyboardMarkup | Non
         return None
     rows = [[
         InlineKeyboardButton(
-            text=db.get("button_text") or "✅ Я был",
-            callback_data=f"mark:{session.id}",
-            style=ButtonStyle.SUCCESS,
+            text=db.get("button_text") or DEFAULT_BUTTON_TEXT,
+            callback_data=f"skip:{session.id}",
+            style=ButtonStyle.DANGER,
         )
     ]]
     if db.get_bool("sick_button"):
@@ -298,19 +310,15 @@ class RefreshDebouncer:
 def attendance_summary(
     db: Database, session: Session
 ) -> tuple[list[str], list[str], list[str]]:
-    """Имена присутствовавших, болеющих и отсутствовавших без причины."""
+    """Имена присутствовавших, болеющих и пропустивших."""
     fmt = db.get("name_format")
-    marks = db.marks(session.id)
-    sick = db.sick_on(session.date)
+    students = db.list_students()
+    statuses = session_statuses(db, session, [st.user_id for st in students])
     present, ill, absent = [], [], []
-    for st in db.list_students():
-        name = student_name(st, fmt)
-        if st.user_id in marks:
-            present.append(name)
-        elif st.user_id in sick:
-            ill.append(name)
-        else:
-            absent.append(name)
+    for st in students:
+        {PRESENT: present, SICK: ill, ABSENT: absent}[statuses[st.user_id]].append(
+            student_name(st, fmt)
+        )
     return present, ill, absent
 
 
@@ -336,7 +344,7 @@ async def close_session(
         if ill:
             text.append("😷 Болеют: " + ", ".join(esc(n) for n in ill))
         if absent:
-            text.append("❌ Не было: " + ", ".join(esc(n) for n in absent))
+            text.append("🚫 Пропустили: " + ", ".join(esc(n) for n in absent))
         await notify_admins(bot, admin_ids, "\n".join(text))
 
 

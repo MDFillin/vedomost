@@ -1,6 +1,7 @@
 """Всё, что происходит в общем чате группы."""
 
 import logging
+import time
 
 from aiogram import Bot, F, Router
 from aiogram.filters import JOIN_TRANSITION, LEAVE_TRANSITION, ChatMemberUpdatedFilter, Command
@@ -10,7 +11,7 @@ from ..config import Config
 from ..db import Database
 from ..members import forget_member, is_chat_member, sync_members, sync_report
 from ..service import RefreshDebouncer, is_open, notify_admins
-from ..utils import esc, fmt_date, student_name
+from ..utils import esc, fmt_date
 
 log = logging.getLogger(__name__)
 
@@ -212,39 +213,66 @@ async def check_access(
     return None
 
 
-@router.callback_query(F.data.startswith("mark:"))
-async def on_mark(callback: CallbackQuery, bot: Bot, db: Database) -> None:
-    session_id = int(callback.data.split(":")[1])
-    session = db.get_session(session_id)
+# Повторное нажатие «Пропускаю» в течение этого времени отменяет пропуск.
+UNDO_WINDOW = 60
+_undo_requests: dict[tuple[int, int], float] = {}
+
+
+@router.callback_query(F.data.startswith("skip:"))
+async def on_skip(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    session = db.get_session(int(callback.data.split(":")[1]))
     if session is None:
         await callback.answer("Это занятие удалено.", show_alert=True)
-        return
-
-    user = callback.from_user
-    if user.id in db.marks(session.id):
-        await callback.answer("Вы уже отметились ✅\nПовторно нажимать не нужно.", show_alert=True)
         return
 
     denied = await check_access(callback, bot, db, session.chat_id)
     if denied:
         await callback.answer(denied, show_alert=True)
         return
-
     if not is_open(db, session):
         await callback.answer("🔒 Отметка по этому занятию уже закрыта.", show_alert=True)
         return
 
+    user = callback.from_user
+    key = (session.id, user.id)
+    day = fmt_date(session.date)
     remember(db, user)
-    if db.mark(session.id, user.id):
-        student = db.get_student(user.id)
-        name = student_name(student, "full") if student else user.full_name
+
+    if db.mark_absent(session.id, user.id):
+        _undo_requests.pop(key, None)
         await callback.answer(
-            f"✅ Присутствие записано!\n{name}, {fmt_date(session.date)}", show_alert=True
+            f"🚫 Записал: вы пропускаете занятие {day}.\n\n"
+            "Передумали и придёте? Нажмите кнопку ещё раз.",
+            show_alert=True,
         )
-        if db.get_bool("show_count") or db.get_bool("show_names"):
-            debouncer.schedule(bot, db, session.id)
+    elif time.monotonic() - _undo_requests.get(key, 0) < UNDO_WINDOW:
+        _undo_requests.pop(key, None)
+        db.unmark_absent(session.id, user.id)
+        await callback.answer(
+            f"✅ Пропуск отменён — {day} вы считаетесь присутствующим.", show_alert=True
+        )
     else:
-        await callback.answer("Вы уже отметились ✅\nПовторно нажимать не нужно.", show_alert=True)
+        _undo_requests[key] = time.monotonic()
+        await callback.answer(
+            f"Вы уже отметили, что пропускаете {day}.\n\n"
+            "Если всё-таки придёте — нажмите «Пропускаю» ещё раз в течение минуты, "
+            "и пропуск отменится.",
+            show_alert=True,
+        )
+        return
+
+    if db.get_bool("show_count") or db.get_bool("show_names"):
+        debouncer.schedule(bot, db, session.id)
+
+
+@router.callback_query(F.data.startswith("mark:"))
+async def on_old_mark_button(callback: CallbackQuery) -> None:
+    # кнопки «Я был» из старых сообщений
+    await callback.answer(
+        "Эта отметка устарела. Теперь отмечаются только те, кого не будет, — "
+        "кнопкой «Пропускаю» в новом сообщении.",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data.startswith("sick:"))

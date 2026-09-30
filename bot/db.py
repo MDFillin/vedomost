@@ -32,7 +32,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     close_at    TEXT,                   -- UTC ISO или NULL (без ограничения)
     closed      INTEGER NOT NULL DEFAULT 0
 );
+-- Устарело: в первых версиях здесь хранились отметки «Я был».
 CREATE TABLE IF NOT EXISTS attendance (
+    session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    user_id     INTEGER NOT NULL,
+    marked_at   TEXT NOT NULL,          -- UTC ISO
+    by_admin    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, user_id)
+);
+-- Кто ПРОПУСКАЕТ занятие (нажал «Пропускаю» или отметил староста).
+-- Все остальные студенты из списка считаются присутствовавшими.
+CREATE TABLE IF NOT EXISTS absences (
     session_id  INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     user_id     INTEGER NOT NULL,
     marked_at   TEXT NOT NULL,          -- UTC ISO
@@ -65,8 +75,13 @@ CREATE TABLE IF NOT EXISTS sick_leaves (
 """
 
 # Дата занятия всегда выводится отдельной строкой над этим текстом.
-DEFAULT_MESSAGE_TEXT = "Если вы на занятии — нажмите кнопку ниже 👇"
+DEFAULT_MESSAGE_TEXT = (
+    "Если сегодня вас <b>не будет</b> на занятиях — нажмите «Пропускаю».\n"
+    "Если вы на паре, ничего нажимать не нужно."
+)
+DEFAULT_BUTTON_TEXT = "🚫 Пропускаю"
 OLD_DEFAULT_TEXTS = {
+    "Если вы на занятии — нажмите кнопку ниже 👇",
     "📅 {день}, {дата}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇",
     "📅 {день}, {дата} {время}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇",
 }
@@ -79,12 +94,12 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "timezone": "",
     "title": "Отметка посещаемости",  # HTML
     "message_text": DEFAULT_MESSAGE_TEXT,  # HTML, с подстановками {дата} {день} {время} {до}
-    "button_text": "✅ Я был",
+    "button_text": DEFAULT_BUTTON_TEXT,
     "mode": "pair",          # pair — отметка на каждой паре, day — одна отметка в день
     "close_mode": "minutes", # minutes | until | eod (до конца дня) | none
     "close_until": "18:00",  # для close_mode = until
-    "show_count": "1",       # показывать счётчик отметившихся в группе
-    "show_names": "0",       # показывать список отметившихся в группе
+    "show_count": "1",       # показывать в группе, сколько человек пропускает
+    "show_names": "0",       # показывать в группе список пропускающих
     "window_minutes": "90",  # для close_mode = minutes
     "name_format": "full",   # full | username | both
     "stats_sort": "name",    # name | time
@@ -192,9 +207,44 @@ class Database:
             f"({','.join('?' * len(OLD_DEFAULT_TEXTS))})",
             (DEFAULT_MESSAGE_TEXT, *OLD_DEFAULT_TEXTS),
         )
+        self.conn.execute(
+            "UPDATE settings SET value = ? WHERE key = 'button_text' AND value = '✅ Я был'",
+            (DEFAULT_BUTTON_TEXT,),
+        )
+        self._migrate_to_absences()
         if row and row["value"] == "0" and not has_mode:
             self.conn.execute("INSERT INTO settings(key, value) VALUES ('close_mode', 'none')")
             self.conn.execute("UPDATE settings SET value = '90' WHERE key = 'window_minutes'")
+
+    def _migrate_to_absences(self) -> None:
+        """Переход с «отмечаются присутствующие» на «отмечаются пропускающие».
+
+        Для старых занятий пропустившими считаются все студенты из списка,
+        кто тогда не нажал «Я был».
+        """
+        done = self.conn.execute("SELECT 1 FROM settings WHERE key = 'logic'").fetchone()
+        if done:
+            return
+        students = [
+            r["user_id"] for r in self.conn.execute(
+                "SELECT user_id FROM students WHERE active = 1 AND in_chat = 1"
+            )
+        ]
+        for s in self.conn.execute("SELECT id, created_at FROM sessions").fetchall():
+            present = {
+                r["user_id"] for r in self.conn.execute(
+                    "SELECT user_id FROM attendance WHERE session_id = ?", (s["id"],)
+                )
+            }
+            for uid in students:
+                if uid not in present:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO absences(session_id, user_id, marked_at, by_admin) "
+                        "VALUES (?, ?, ?, 1)",
+                        (s["id"], uid, s["created_at"]),
+                    )
+        self.conn.execute("INSERT INTO settings(key, value) VALUES ('logic', 'absence')")
+        self.conn.commit()
 
     # ---------- настройки ----------
     def get(self, key: str) -> str:
@@ -308,6 +358,7 @@ class Database:
 
     def delete_student(self, user_id: int) -> None:
         self.conn.execute("DELETE FROM attendance WHERE user_id = ?", (user_id,))
+        self.conn.execute("DELETE FROM absences WHERE user_id = ?", (user_id,))
         self.conn.execute("DELETE FROM sick_leaves WHERE user_id = ?", (user_id,))
         self.conn.execute("DELETE FROM students WHERE user_id = ?", (user_id,))
         self.conn.commit()
@@ -423,47 +474,36 @@ class Database:
 
     def delete_session(self, session_id: int) -> None:
         self.conn.execute("DELETE FROM attendance WHERE session_id = ?", (session_id,))
+        self.conn.execute("DELETE FROM absences WHERE session_id = ?", (session_id,))
         self.conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
         self.conn.commit()
 
     # ---------- отметки ----------
-    def mark(self, session_id: int, user_id: int, by_admin: bool = False) -> bool:
-        """Атомарно ставит отметку. Возвращает False, если отметка уже была."""
+    def mark_absent(self, session_id: int, user_id: int, by_admin: bool = False) -> bool:
+        """Атомарно записывает пропуск. Возвращает False, если он уже был записан."""
         cur = self.conn.execute(
-            "INSERT OR IGNORE INTO attendance(session_id, user_id, marked_at, by_admin) "
+            "INSERT OR IGNORE INTO absences(session_id, user_id, marked_at, by_admin) "
             "VALUES (?, ?, ?, ?)",
             (session_id, user_id, utcnow().isoformat(), int(by_admin)),
         )
         self.conn.commit()
         return cur.rowcount == 1
 
-    def unmark(self, session_id: int, user_id: int) -> None:
+    def unmark_absent(self, session_id: int, user_id: int) -> None:
         self.conn.execute(
-            "DELETE FROM attendance WHERE session_id = ? AND user_id = ?", (session_id, user_id)
+            "DELETE FROM absences WHERE session_id = ? AND user_id = ?", (session_id, user_id)
         )
         self.conn.commit()
 
-    def marks(self, session_id: int) -> dict[int, Mark]:
+    def absences(self, session_id: int) -> dict[int, Mark]:
         rows = self.conn.execute(
-            "SELECT user_id, marked_at, by_admin FROM attendance WHERE session_id = ? "
+            "SELECT user_id, marked_at, by_admin FROM absences WHERE session_id = ? "
             "ORDER BY marked_at",
             (session_id,),
         ).fetchall()
         return {
             r["user_id"]: Mark(r["user_id"], r["marked_at"], bool(r["by_admin"])) for r in rows
         }
-
-    def attendance_counts(self) -> dict[int, int]:
-        rows = self.conn.execute(
-            "SELECT user_id, COUNT(*) AS n FROM attendance GROUP BY user_id"
-        ).fetchall()
-        return {r["user_id"]: r["n"] for r in rows}
-
-    def student_session_ids(self, user_id: int) -> set[int]:
-        rows = self.conn.execute(
-            "SELECT session_id FROM attendance WHERE user_id = ?", (user_id,)
-        ).fetchall()
-        return {r["session_id"] for r in rows}
 
     # ---------- расписание ----------
     def list_schedule(self) -> list[tuple[int, int, str]]:

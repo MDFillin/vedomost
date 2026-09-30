@@ -172,8 +172,8 @@ def test_schedule_due_and_skip():
 def test_mark_is_atomic():
     db = Database(":memory:")
     s = db.create_session(GROUP, "2026-09-30", "10:00", "slot", None)
-    assert db.mark(s.id, 1) is True
-    assert db.mark(s.id, 1) is False
+    assert db.mark_absent(s.id, 1) is True
+    assert db.mark_absent(s.id, 1) is False
     assert db.create_session(GROUP, "2026-09-30", "10:00", "slot", None) is None
 
 
@@ -192,43 +192,53 @@ async def test_full_flow(env):
     s = await send_session(bot, db, date.today(), "10:00", slot="x")
     group_msg = session.of(SendMessage)[-1]
     assert group_msg.chat_id == GROUP
-    assert buttons(group_msg) == [f"mark:{s.id}", f"sick:{s.id}"]
-    assert group_msg.reply_markup.inline_keyboard[0][0].style == "success"
+    assert buttons(group_msg) == [f"skip:{s.id}", f"sick:{s.id}"]
+    assert group_msg.reply_markup.inline_keyboard[0][0].style == "danger"
+    assert group_msg.reply_markup.inline_keyboard[0][0].text == "🚫 Пропускаю"
     for uid, name in STUDENTS:
         await press(dp, bot, uid, "register", GROUP, name)
     assert len(db.list_students()) == 4  # 3 студента + староста (админ чата)
 
-    # отметка + повторное нажатие
-    await press(dp, bot, 201, f"mark:{s.id}", GROUP, "Иван Иванов")
-    assert "записано" in last_alert(session)
-    await press(dp, bot, 201, f"mark:{s.id}", GROUP, "Иван Иванов")
-    assert "уже отметились" in last_alert(session)
-    await press(dp, bot, 202, f"mark:{s.id}", GROUP, "Пётр Петров")
-    assert set(db.marks(s.id)) == {201, 202}
+    # пропуск, повторное нажатие (запрос подтверждения) и отмена
+    await press(dp, bot, 201, f"skip:{s.id}", GROUP, "Иван Иванов")
+    assert "пропускаете" in last_alert(session)
+    await press(dp, bot, 201, f"skip:{s.id}", GROUP, "Иван Иванов")
+    assert "ещё раз" in last_alert(session) and 201 in db.absences(s.id)
+    await press(dp, bot, 201, f"skip:{s.id}", GROUP, "Иван Иванов")
+    assert "отменён" in last_alert(session) and 201 not in db.absences(s.id)
+    await press(dp, bot, 201, f"skip:{s.id}", GROUP, "Иван Иванов")
+    await press(dp, bot, 202, f"skip:{s.id}", GROUP, "Пётр Петров")
+    assert set(db.absences(s.id)) == {201, 202}
 
     # счётчик в группе обновляется с задержкой
     await asyncio.sleep(2.2)
     edits = [e for e in session.of(EditMessageText) if e.chat_id == GROUP]
-    assert edits and "Отметились: <b>2</b>" in edits[-1].text
+    assert edits and "Пропускают: <b>2</b>" in edits[-1].text
 
-    # карточка занятия у старосты
+    # карточка занятия у старосты: кто не нажимал — был
     await press(dp, bot, ADMIN, f"a:s:{s.id}", ADMIN)
     card = session.of(EditMessageText)[-1].text
-    assert "Были: 2/4" in card and "Анна Смирнова" in card.split("Не было")[1]
+    were, skipped = card.split("Пропускают")
+    assert "Были: 2/4" in were and "Анна Смирнова" in were
+    assert "Иван Иванов" in skipped and "Пётр Петров" in skipped
 
     # закрытие — нажать больше нельзя
     await press(dp, bot, ADMIN, f"a:sc:{s.id}", ADMIN)
-    await press(dp, bot, 203, f"mark:{s.id}", GROUP, "Анна Смирнова")
+    await press(dp, bot, 203, f"skip:{s.id}", GROUP, "Анна Смирнова")
     assert "закрыта" in last_alert(session)
 
-    # староста отмечает вручную
+    # староста ставит пропуск вручную
     await press(dp, bot, ADMIN, f"a:st:{s.id}:203:0", ADMIN)
-    assert 203 in db.marks(s.id) and db.marks(s.id)[203].by_admin
+    assert 203 in db.absences(s.id) and db.absences(s.id)[203].by_admin
+
+    # старые кнопки «Я был» из прошлых сообщений
+    await press(dp, bot, 203, f"mark:{s.id}", GROUP, "Анна Смирнова")
+    assert "устарела" in last_alert(session)
 
     # не-админ в личке панель не видит
     before = len(session.of(SendMessage))
     await text(dp, bot, 201, "/menu")
-    assert "Отмечайтесь кнопкой" in session.of(SendMessage)[before].text
+    assert "Пропускаю" in session.of(SendMessage)[before].text
     await press(dp, bot, 201, "a:menu", 201)
     assert len(session.of(SendMessage)) == before + 1  # кнопка проигнорирована
 
@@ -282,7 +292,8 @@ async def test_click_every_admin_button(env):
     db.add_extra_date("2099-01-01", "10:00")
     db.add_skip_date("2099-01-02")
     s = await send_session(bot, db, date.today(), "10:00")
-    db.mark(s.id, 201)
+    db.mark_absent(s.id, 201)
+    db.mark_absent(s.id, 202, by_admin=True)
     db.rename_student(202, "Петров П.")
 
     skip = {"a:sdy:", "a:udy:", "a:schxsa", "a:schxw", "a:schxd", "a:schxs:"}
@@ -322,36 +333,36 @@ async def test_protection(env):
     assert session.of(SendMessage)[-1].protect_content is True  # запрет пересылки
 
     # посторонний, не состоящий в чате
-    await press(dp, bot, OUTSIDER, f"mark:{s.id}", GROUP, "Чужой Человек")
+    await press(dp, bot, OUTSIDER, f"skip:{s.id}", GROUP, "Чужой Человек")
     assert "только участники" in last_alert(session)
     assert db.get_student(OUTSIDER) is None  # в список не попал
 
     # нажатие с пересланной копии в другом чате
-    await press(dp, bot, 201, f"mark:{s.id}", -5555, "Иван Иванов")
+    await press(dp, bot, 201, f"skip:{s.id}", -5555, "Иван Иванов")
     assert "только в чате группы" in last_alert(session)
-    await press(dp, bot, 201, f"mark:{s.id}", 201, "Иван Иванов")
+    await press(dp, bot, 201, f"skip:{s.id}", 201, "Иван Иванов")
     assert "только в чате группы" in last_alert(session)
-    assert not db.marks(s.id)
+    assert not db.absences(s.id)
 
     # исключённый старостой
     db.upsert_student(202, "Пётр Петров", None)
     db.set_student_active(202, False)
-    await press(dp, bot, 202, f"mark:{s.id}", GROUP, "Пётр Петров")
+    await press(dp, bot, 202, f"skip:{s.id}", GROUP, "Пётр Петров")
     assert "исключил" in last_alert(session)
 
     # «только из списка»: новичок не может, студент из списка — может
     db.set("roster_only", "1")
-    await press(dp, bot, 203, f"mark:{s.id}", GROUP, "Анна Смирнова")
+    await press(dp, bot, 203, f"skip:{s.id}", GROUP, "Анна Смирнова")
     assert "нет в списке" in last_alert(session)
     db.upsert_student(203, "Анна Смирнова", None)
-    await press(dp, bot, 203, f"mark:{s.id}", GROUP, "Анна Смирнова")
-    assert "записано" in last_alert(session)
+    await press(dp, bot, 203, f"skip:{s.id}", GROUP, "Анна Смирнова")
+    assert "пропускаете" in last_alert(session)
 
     # при выключенной проверке членства посторонний пройдёт
     db.set("roster_only", "0")
     db.set("members_only", "0")
-    await press(dp, bot, OUTSIDER, f"mark:{s.id}", GROUP, "Чужой Человек")
-    assert "записано" in last_alert(session)
+    await press(dp, bot, OUTSIDER, f"skip:{s.id}", GROUP, "Чужой Человек")
+    assert "пропускаете" in last_alert(session)
 
 
 async def test_day_mode(env):
@@ -420,7 +431,7 @@ async def test_message_template(env):
     await press(dp, bot, ADMIN, "a:setpv", ADMIN)
     assert "Успей до" in session.of(SendMessage)[-1].text
     await press(dp, bot, ADMIN, "a:setmr", ADMIN)
-    assert db.get("message_text").startswith("Если вы на занятии")
+    assert db.get("message_text").startswith("Если сегодня вас")
 
 
 def member_update(chat_id: int, by: int, old: str, new: str, who: User) -> ChatMemberUpdated:
@@ -532,7 +543,7 @@ async def test_sick_leave_flow(env):
     # в карточке занятия: отдельный список болеющих
     await press(dp, bot, ADMIN, f"a:s:{s.id}", ADMIN)
     card = session.of(EditMessageText)[-1].text
-    assert "На больничном: 1" in card and "Не было без причины: 2" in card
+    assert "На больничном: 1" in card and "Пропускают: 0" in card and "Были: 2/3" in card
 
     # итоговая ведомость в Excel
     await press(dp, bot, ADMIN, f"a:xl:{today:%Y-%m}", ADMIN)
@@ -541,7 +552,7 @@ async def test_sick_leave_flow(env):
     rows = {ws.cell(r, 1).value: [ws.cell(r, c).value for c in range(2, ws.max_column + 1)]
             for r in range(3, ws.max_row + 1)}
     assert rows["Пётр Петров"][0] == "б"
-    assert rows["Иван Иванов"][0] == "н"
+    assert rows["Иван Иванов"][0] is None  # ничего не нажимал — был
     assert rows["Иван Иванов"][-1] == '=COUNTIFS(B4:B4,"Н")'
     assert "Больничные" in wb.sheetnames
 
@@ -592,7 +603,7 @@ async def test_sick_leave_typed_and_by_admin(env):
     # кнопку можно выключить
     await press(dp, bot, ADMIN, "a:sett:sick_button", ADMIN)
     s = await send_session(bot, db, today, "12:00")
-    assert buttons(session.of(SendMessage)[-1]) == [f"mark:{s.id}"]
+    assert buttons(session.of(SendMessage)[-1]) == [f"skip:{s.id}"]
 
 
 async def test_student_start_menu(env):
@@ -611,9 +622,10 @@ async def test_months_and_excel_format(env):
         db.upsert_student(uid, name, None)
     sep = [await send_session(bot, db, date(2026, 9, d), "10:00") for d in (1, 2, 4)]
     octs = [await send_session(bot, db, date(2026, 10, d), "10:00") for d in (1, 2)]
-    for s in sep + octs:
-        db.mark(s.id, 201)
-    db.mark(sep[0].id, 202)
+    db.mark_absent(sep[0].id, 203)
+    db.mark_absent(sep[1].id, 202)
+    db.mark_absent(sep[2].id, 202)
+    db.mark_absent(octs[1].id, 201)
     db.add_sick_leave(203, "2026-09-02", "2026-10-01")
 
     # история по месяцам
@@ -660,7 +672,10 @@ def test_old_default_text_migrates():
     db = Database(":memory:")
     db.set("message_text", "📅 {день}, {дата}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇")
     db._migrate()
-    assert db.get("message_text") == "Если вы на занятии — нажмите кнопку ниже 👇"
+    assert db.get("message_text").startswith("Если сегодня вас <b>не будет</b>")
+    db.set("message_text", "Если вы на занятии — нажмите кнопку ниже 👇")
+    db._migrate()
+    assert db.get("message_text").startswith("Если сегодня вас <b>не будет</b>")
 
 
 # ---------- сообщество: несколько чатов и темы ----------
@@ -685,8 +700,8 @@ async def test_bind_to_forum_topic(env):
     sent = session.of(SendMessage)[-1]
     assert sent.chat_id == GROUP and sent.message_thread_id == 77
 
-    await press(dp, bot, 201, f"mark:{s.id}", GROUP, "Иван Иванов")
-    assert "записано" in last_alert(session)
+    await press(dp, bot, 201, f"skip:{s.id}", GROUP, "Иван Иванов")
+    assert "пропускаете" in last_alert(session)
 
     # /bind в «Общем» (без темы) переключает обратно на весь чат
     await text(dp, bot, ADMIN, "/bind", GROUP, "supergroup")
@@ -706,7 +721,7 @@ async def test_adding_bot_to_second_chat_does_not_rebind(env):
 
     # сообщения и кнопки из другого чата сообщества не влияют ни на что
     s = await send_session(bot, db, date.today(), "10:00")
-    await press(dp, bot, 201, f"mark:{s.id}", -2002, "Иван Иванов")
+    await press(dp, bot, 201, f"skip:{s.id}", -2002, "Иван Иванов")
     assert "только в чате группы" in last_alert(session)
     await text(dp, bot, 305, "привет", -2002, "supergroup")
     assert db.get_student(305) is None
@@ -758,5 +773,29 @@ async def test_group_migration_moves_sessions(env):
     await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
     assert db.group_chat_id == -100555
     assert db.get_session(s.id).chat_id == -100555
-    await press(dp, bot, 201, f"mark:{s.id}", -100555, "Иван Иванов")
-    assert "записано" in last_alert(session)
+    await press(dp, bot, 201, f"skip:{s.id}", -100555, "Иван Иванов")
+    assert "пропускаете" in last_alert(session)
+
+
+def test_migration_from_presence_logic(tmp_path):
+    """Старая база с отметками «Я был» превращается в пропуски."""
+    import sqlite3
+
+    path = str(tmp_path / "old.db")
+    db = Database(path)
+    db.conn.execute("DELETE FROM settings WHERE key = 'logic'")
+    db.set("button_text", "✅ Я был")
+    for uid, name in STUDENTS:
+        db.upsert_student(uid, name, None)
+    s = db.create_session(GROUP, "2026-09-29", "10:00", None, None)
+    conn = db.conn
+    conn.execute("INSERT INTO attendance VALUES (?, 201, '2026-09-29T07:00:00+00:00', 0)", (s.id,))
+    conn.commit()
+    conn.close()
+
+    db = Database(path)
+    assert set(db.absences(s.id)) == {202, 203}
+    assert db.get("button_text") == "🚫 Пропускаю"
+    db2 = Database(path)  # повторный запуск ничего не меняет
+    assert set(db2.absences(s.id)) == {202, 203}
+    assert sqlite3.connect(path).execute("SELECT value FROM settings WHERE key='logic'").fetchone()

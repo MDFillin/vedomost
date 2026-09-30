@@ -14,6 +14,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 from .db import Database, Session
+from .stats import ABSENT, SICK, session_statuses
 from .utils import MONTHS, WEEKDAYS_SHORT, to_local
 
 FONT = "Times New Roman"
@@ -49,7 +50,6 @@ def _month_sheet(wb: Workbook, db: Database, ym: str, sessions: list[Session],
                  group_name: str) -> None:
     ws = wb.create_sheet(month_title(ym)[:31])
     students = sorted(db.list_students(), key=lambda s: s.name.lower())
-    leaves = db.sick_days_by_user()
     sessions = sorted(sessions, key=lambda s: (s.date, s.time or ""))
     per_day: dict[str, int] = {}
     for s in sessions:
@@ -77,16 +77,17 @@ def _month_sheet(wb: Workbook, db: Database, ym: str, sessions: list[Session],
     _cell(ws, 2, total_col, "ИТОГО", bold=True, color="FF0000", align=CENTER)
     ws.column_dimensions[get_column_letter(total_col)].width = 9
 
-    marks = {s.id: db.marks(s.id) for s in sessions}
+    ids = [st.user_id for st in students]
+    statuses = {s.id: session_statuses(db, s, ids) for s in sessions}
     for r, st in enumerate(students, start=3):
         _cell(ws, r, 1, st.name, align=Alignment(indent=1))
         for i, s in enumerate(sessions):
             value, fill = None, None
-            if st.user_id not in marks[s.id]:
-                if any(lv.covers(s.date) for lv in leaves.get(st.user_id, [])):
-                    value, fill = "б", SICK_FILL
-                else:
-                    value = "н"
+            status = statuses[s.id][st.user_id]
+            if status == SICK:
+                value, fill = "б", SICK_FILL
+            elif status == ABSENT:
+                value = "н"
             _cell(ws, r, i + 2, value, fill=fill, align=CENTER)
         formula = f'=COUNTIFS(B{r}:{last}{r},"Н")' if sessions else 0
         _cell(ws, r, total_col, formula, bold=True, align=CENTER)
