@@ -6,6 +6,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .db import Database, Student
 
 WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+MONTHS = [
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+MONTHS_GEN = [
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+]
 WEEKDAYS_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
 NAME_FORMATS = {
@@ -49,6 +57,12 @@ def fmt_date(iso_date: str, with_weekday: bool = False, full_weekday: bool = Fal
         wd = (WEEKDAYS_FULL if full_weekday else WEEKDAYS_SHORT)[d.weekday()]
         text = f"{wd}, {text}" if full_weekday else f"{wd} {text}"
     return text
+
+
+def fmt_long_date(iso_date: str) -> str:
+    """«Среда, 30 сентября 2026»."""
+    d = date.fromisoformat(iso_date)
+    return f"{WEEKDAYS_FULL[d.weekday()]}, {d.day} {MONTHS_GEN[d.month - 1]} {d.year}"
 
 
 def fmt_short_date(iso_date: str) -> str:

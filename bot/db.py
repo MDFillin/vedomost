@@ -64,10 +64,16 @@ CREATE TABLE IF NOT EXISTS sick_leaves (
 );
 """
 
-DEFAULT_MESSAGE_TEXT = "📅 {день}, {дата} {время}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇"
+# Дата занятия всегда выводится отдельной строкой над этим текстом.
+DEFAULT_MESSAGE_TEXT = "Если вы на занятии — нажмите кнопку ниже 👇"
+OLD_DEFAULT_TEXTS = {
+    "📅 {день}, {дата}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇",
+    "📅 {день}, {дата} {время}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇",
+}
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "group_chat_id": "",
+    "group_name": "",        # название группы для ведомости (по умолчанию — название чата)
     "timezone": "",
     "title": "Отметка посещаемости",  # HTML
     "message_text": DEFAULT_MESSAGE_TEXT,  # HTML, с подстановками {дата} {день} {время} {до}
@@ -178,6 +184,12 @@ class Database:
         has_mode = self.conn.execute(
             "SELECT 1 FROM settings WHERE key = 'close_mode'"
         ).fetchone()
+        # старый стандартный текст содержал дату — теперь она выводится всегда
+        self.conn.execute(
+            f"UPDATE settings SET value = ? WHERE key = 'message_text' AND value IN "
+            f"({','.join('?' * len(OLD_DEFAULT_TEXTS))})",
+            (DEFAULT_MESSAGE_TEXT, *OLD_DEFAULT_TEXTS),
+        )
         if row and row["value"] == "0" and not has_mode:
             self.conn.execute("INSERT INTO settings(key, value) VALUES ('close_mode', 'none')")
             self.conn.execute("UPDATE settings SET value = '90' WHERE key = 'window_minutes'")
@@ -334,6 +346,22 @@ class Database:
             return None
         self.conn.commit()
         return self.get_session(cur.lastrowid)
+
+    def list_months(self) -> list[tuple[str, int]]:
+        """[(YYYY-MM, число занятий)] от новых к старым."""
+        rows = self.conn.execute(
+            "SELECT substr(date, 1, 7) AS ym, COUNT(*) AS n FROM sessions "
+            "GROUP BY ym ORDER BY ym DESC"
+        )
+        return [(r["ym"], r["n"]) for r in rows]
+
+    def list_month_sessions(self, ym: str) -> list[Session]:
+        rows = self.conn.execute(
+            "SELECT * FROM sessions WHERE date LIKE ? "
+            "ORDER BY date DESC, COALESCE(time, '') DESC, id DESC",
+            (f"{ym}-%",),
+        ).fetchall()
+        return [self._session(r) for r in rows]
 
     def slot_exists(self, slot: str) -> bool:
         return self.conn.execute("SELECT 1 FROM sessions WHERE slot = ?", (slot,)).fetchone() is not None

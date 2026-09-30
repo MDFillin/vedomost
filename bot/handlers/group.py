@@ -26,6 +26,8 @@ debouncer = RefreshDebouncer()
 
 async def bind_and_sync(bot: Bot, db: Database, config: Config, chat_id: int, title: str) -> str:
     db.set("group_chat_id", chat_id)
+    if not db.get("group_name") and title:
+        db.set("group_name", title)  # название для ведомости, можно поменять в настройках
     result = await sync_members(bot, db, config)
     return f"✅ Чат «{esc(title)}» привязан.\n\n" + sync_report(result, db, config)
 

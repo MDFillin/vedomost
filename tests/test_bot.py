@@ -1,9 +1,11 @@
 """Тесты без сети: Telegram API подменяется фейковой сессией."""
 
 import asyncio
+import io
 from datetime import date, datetime, timedelta
 from typing import Any
 
+import openpyxl
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -416,7 +418,7 @@ async def test_message_template(env):
     await press(dp, bot, ADMIN, "a:setpv", ADMIN)
     assert "Успей до" in session.of(SendMessage)[-1].text
     await press(dp, bot, ADMIN, "a:setmr", ADMIN)
-    assert db.get("message_text").startswith("📅 {день}")
+    assert db.get("message_text").startswith("Если вы на занятии")
 
 
 def member_update(chat_id: int, by: int, old: str, new: str, who: User) -> ChatMemberUpdated:
@@ -530,12 +532,16 @@ async def test_sick_leave_flow(env):
     card = session.of(EditMessageText)[-1].text
     assert "На больничном: 1" in card and "Не было без причины: 2" in card
 
-    # итоговая таблица
-    await press(dp, bot, ADMIN, "a:csv", ADMIN)
-    csv_bytes = session.of(SendDocument)[-1].document.data.decode("utf-8-sig")
-    row = next(line for line in csv_bytes.splitlines() if line.startswith("Пётр Петров;"))
-    assert row.split(";")[1] == "б"
-    assert "Больничные" in csv_bytes and "сам студент" in csv_bytes
+    # итоговая ведомость в Excel
+    await press(dp, bot, ADMIN, f"a:xl:{today:%Y-%m}", ADMIN)
+    wb = openpyxl.load_workbook(io.BytesIO(session.of(SendDocument)[-1].document.data))
+    ws = wb.worksheets[0]
+    rows = {ws.cell(r, 1).value: [ws.cell(r, c).value for c in range(2, ws.max_column + 1)]
+            for r in range(3, ws.max_row + 1)}
+    assert rows["Пётр Петров"][0] == "б"
+    assert rows["Иван Иванов"][0] == "н"
+    assert rows["Иван Иванов"][-1] == '=COUNTIFS(B4:B4,"Н")'
+    assert "Больничные" in wb.sheetnames
 
     # студент видит свои больничные и может удалить
     await press(dp, bot, 202, "sk:my", 202, "Пётр Петров")
@@ -591,3 +597,65 @@ async def test_student_start_menu(env):
     db, bot, dp, session = env
     await text(dp, bot, 201, "/start")
     assert buttons(session.of(SendMessage)[-1]) == ["sk:new", "sk:my"]
+
+
+# ---------- месяцы, ведомость, дата ----------
+
+async def test_months_and_excel_format(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    db.set("group_name", "УФРС24-2")
+    for uid, name in STUDENTS:
+        db.upsert_student(uid, name, None)
+    sep = [await send_session(bot, db, date(2026, 9, d), "10:00") for d in (1, 2, 4)]
+    octs = [await send_session(bot, db, date(2026, 10, d), "10:00") for d in (1, 2)]
+    for s in sep + octs:
+        db.mark(s.id, 201)
+    db.mark(sep[0].id, 202)
+    db.add_sick_leave(203, "2026-09-02", "2026-10-01")
+
+    # история по месяцам
+    await press(dp, bot, ADMIN, "a:sl:0", ADMIN)
+    m = session.of(EditMessageText)[-1]
+    assert "Октябрь 2026" in m.text and "Сентябрь 2026" in m.text
+    assert buttons(m)[:2] == ["a:ml:2026-10:0", "a:ml:2026-09:0"]
+    await press(dp, bot, ADMIN, "a:ml:2026-09:0", ADMIN)
+    m = session.of(EditMessageText)[-1]
+    assert "Занятий: 3" in m.text
+    assert [b for b in buttons(m) if b.startswith("a:s:")] == [f"a:s:{s.id}" for s in sep[::-1]]
+
+    # ведомость: все месяцы, каждый на своём листе
+    await press(dp, bot, ADMIN, "a:xl:all", ADMIN)
+    wb = openpyxl.load_workbook(io.BytesIO(session.of(SendDocument)[-1].document.data))
+    assert wb.sheetnames == ["Сентябрь 2026", "Октябрь 2026", "Больничные"]
+    ws = wb["Сентябрь 2026"]
+    assert ws["A1"].value == "УФРС24-2" and ws["A2"].value == " СЕНТЯБРЬ 2026"
+    assert [ws.cell(1, c).value for c in range(2, 5)] == ["Вт", "Ср", "Пт"]
+    assert [ws.cell(2, c).value for c in range(2, 6)] == [1, 2, 4, "ИТОГО"]
+    names = [ws.cell(r, 1).value for r in range(3, 6)]
+    assert names == ["Анна Смирнова", "Иван Иванов", "Пётр Петров"]  # по алфавиту
+    assert [ws.cell(3, c).value for c in range(2, 6)] == ["н", "б", "б", '=COUNTIFS(B3:D3,"Н")']
+    assert [ws.cell(4, c).value for c in range(2, 5)] == [None, None, None]
+    assert [ws.cell(5, c).value for c in range(2, 5)] == [None, "н", "н"]
+    assert ws["C3"].fill.fgColor.rgb.endswith("FBE4D5")
+    assert ws["A2"].fill.fgColor.rgb.endswith("FFFF00")
+    assert ws["E2"].font.color.rgb.endswith("FF0000") and ws["A1"].font.name == "Times New Roman"
+
+
+async def test_group_message_has_date(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    db.set("message_text", "Просто текст без даты")
+    await send_session(bot, db, date(2026, 9, 30), "10:00")
+    msg = session.of(SendMessage)[-1].text
+    assert "📅 <b>Среда, 30 сентября 2026</b> · 10:00" in msg
+    db.set("mode", "day")
+    await send_session(bot, db, date(2026, 10, 1), "10:00")
+    assert "📅 <b>Четверг, 1 октября 2026</b>\n" in session.of(SendMessage)[-1].text
+
+
+def test_old_default_text_migrates():
+    db = Database(":memory:")
+    db.set("message_text", "📅 {день}, {дата}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇")
+    db._migrate()
+    assert db.get("message_text") == "Если вы на занятии — нажмите кнопку ниже 👇"

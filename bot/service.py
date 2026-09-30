@@ -10,7 +10,16 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .db import Database, Session
-from .utils import WEEKDAYS_FULL, esc, fmt_date, get_tz, now_local, student_name, to_local
+from .utils import (
+    WEEKDAYS_FULL,
+    esc,
+    fmt_date,
+    fmt_long_date,
+    get_tz,
+    now_local,
+    student_name,
+    to_local,
+)
 
 log = logging.getLogger(__name__)
 
@@ -59,9 +68,11 @@ def group_text(db: Database, session: Session) -> str:
     body = render_template(
         db, db.get("message_text"), session.date, session.time, session.close_at
     )
-    lines = []
-    if title:
-        lines += [f"📋 <b>{title}</b>" if "<" not in title else f"📋 {title}"]
+    when = f"📅 <b>{fmt_long_date(session.date)}</b>"
+    if session.time:
+        when += f" · {session.time}"
+    header = [f"📋 <b>{title}</b>" if "<" not in title else f"📋 {title}"] if title else []
+    lines = ["\n".join(header + [when])]  # дата всегда сразу под заголовком
     if body:
         lines += [body]
 

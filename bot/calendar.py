@@ -6,12 +6,8 @@ from datetime import date
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from .utils import WEEKDAYS_SHORT
+from .utils import MONTHS, WEEKDAYS_SHORT
 
-MONTHS = [
-    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
-]
 
 _DATE_TOKEN = re.compile(r"\d{1,2}\.\d{1,2}(?:\.\d{2,4})?")
 

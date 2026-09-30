@@ -1,7 +1,5 @@
 """Админ-панель старосты в личных сообщениях с ботом."""
 
-import csv
-import io
 from datetime import date, timedelta
 
 from aiogram import Bot, F, Router
@@ -19,6 +17,7 @@ from aiogram.types import (
 )
 
 from ..config import Config
+from ..excel import build_workbook, month_title
 from ..db import DEFAULT_SETTINGS, Database, Session
 from .sick import student_menu_kb
 from ..members import sync_members, sync_report
@@ -74,6 +73,7 @@ class Input(StatesGroup):
     message_text = State()
     close_until = State()
     sick_button = State()
+    group_name = State()
     button = State()
     timezone = State()
     rename = State()
@@ -236,39 +236,100 @@ async def show_menu(target: Message | CallbackQuery, db: Database) -> None:
     for s in open_sessions:
         rows.append([(f"🟢 Идёт отметка: {session_title(s)}", f"a:s:{s.id}")])
     rows += [
-        [("📊 Занятия и посещаемость", "a:sl:0")],
+        [("📊 Посещаемость по месяцам", "a:sl:0")],
         [("👥 Студенты и сводка", "a:stl:0"), ("😷 Больничные", "a:sick")],
         [("🗓 Расписание", "a:sch"), ("⚙️ Настройки", "a:set")],
         [("📤 Отправить отметку сейчас", "a:send")],
-        [("📥 Выгрузить таблицу (CSV)", "a:csv")],
+        [("📥 Ведомость в Excel", "a:xl")],
     ]
     await show(target, "\n".join(lines), kb(*rows))
 
 
 # ---------- занятия ----------
 
-@router.callback_query(F.data.startswith("a:sl:"))
-async def sessions_list(callback: CallbackQuery, db: Database) -> None:
-    await show_sessions_list(callback, db, int(callback.data.split(":")[2]))
-
-
-async def show_sessions_list(callback: CallbackQuery, db: Database, page: int) -> None:
-    total = db.count_sessions()
-    sessions = db.list_sessions(SESSIONS_PER_PAGE, page * SESSIONS_PER_PAGE)
-    students_total = len(db.list_students())
-
-    rows: list[Row] = []
+def month_stats(db: Database, sessions: list[Session]) -> dict:
+    """Сводка по набору занятий: сколько было, болело и пропустило без причины."""
+    students = db.list_students()
+    ids = {st.user_id for st in students}
+    present = ill = absent = 0
+    absent_by: dict[int, int] = {}
     for s in sessions:
-        present = len(db.marks(s.id))
-        icon = "🟢" if is_open(db, s) else "📅"
-        rows.append([(f"{icon} {session_title(s)} — {present}/{students_total}", f"a:s:{s.id}")])
-    rows.append(pager("a:sl", page, total, SESSIONS_PER_PAGE))
-    rows.append(BACK_TO_MENU)
+        marks = set(db.marks(s.id)) & ids
+        sick = (db.sick_on(s.date) & ids) - marks
+        present += len(marks)
+        ill += len(sick)
+        for uid in ids - marks - sick:
+            absent += 1
+            absent_by[uid] = absent_by.get(uid, 0) + 1
+    total = len(sessions) * len(students)
+    return {"present": present, "sick": ill, "absent": absent, "total": total,
+            "absent_by": absent_by}
 
-    text = "📊 <b>Занятия</b>\n\nВыберите день, чтобы увидеть кто был и кого не было."
-    if not total:
-        text = "📊 <b>Занятия</b>\n\nПока ни одной отметки не было."
-    await show(callback, text, kb(*rows))
+
+@router.callback_query(F.data.startswith("a:sl:"))
+async def months_list(callback: CallbackQuery, db: Database) -> None:
+    await show_months(callback, db)
+
+
+async def show_months(callback: CallbackQuery, db: Database) -> None:
+    months = db.list_months()
+    lines = ["📊 <b>Посещаемость по месяцам</b>", ""]
+    rows: list[Row] = []
+    for ym, n in months[:24]:
+        st = month_stats(db, db.list_month_sessions(ym))
+        lines.append(
+            f"<b>{month_title(ym)}</b> — занятий: {n}, посещаемость "
+            f"{pct(st['present'], st['total'])}, 😷 {st['sick']}, н: {st['absent']}"
+        )
+        rows.append([(f"📅 {month_title(ym)} ({n})", f"a:ml:{ym}:0")])
+    if not months:
+        lines.append("Пока ни одной отметки не было.")
+    else:
+        lines += ["", "Выберите месяц, чтобы увидеть дни и кто был / кого не было."]
+    rows.append(BACK_TO_MENU)
+    await show(callback, "\n".join(lines), kb(*rows))
+
+
+@router.callback_query(F.data.startswith("a:ml:"))
+async def month_view(callback: CallbackQuery, db: Database) -> None:
+    _, _, ym, page = callback.data.split(":")
+    await show_month(callback, db, ym, int(page))
+
+
+async def show_month(callback: CallbackQuery, db: Database, ym: str, page: int) -> None:
+    sessions = db.list_month_sessions(ym)
+    if not sessions:
+        await show_months(callback, db)
+        return
+    fmt = db.get("name_format")
+    st = month_stats(db, sessions)
+    students_total = len(db.list_students())
+    lines = [
+        f"📅 <b>{month_title(ym)}</b>",
+        f"Занятий: {len(sessions)} · посещаемость {pct(st['present'], st['total'])}",
+        f"✅ отметок: {st['present']} · 😷 больничных: {st['sick']} · ❌ «н»: {st['absent']}",
+    ]
+    worst = sorted(st["absent_by"].items(), key=lambda kv: -kv[1])[:5]
+    if worst:
+        lines += ["", "Больше всего пропусков без причины:"]
+        for uid, n in worst:
+            student = db.get_student(uid)
+            lines.append(f"• {esc(student_name(student, fmt)) if student else uid} — {n}")
+
+    chunk = sessions[page * SESSIONS_PER_PAGE:(page + 1) * SESSIONS_PER_PAGE]
+    rows: list[Row] = []
+    for s in chunk:
+        marks = db.marks(s.id)
+        sick = len(db.sick_on(s.date) - set(marks))
+        icon = "🟢" if is_open(db, s) else "📅"
+        label = f"{icon} {session_title(s)} — {len(marks)}/{students_total}"
+        if sick:
+            label += f" 😷{sick}"
+        rows.append([(label, f"a:s:{s.id}")])
+    rows.append(pager(f"a:ml:{ym}", page, len(sessions), SESSIONS_PER_PAGE))
+    rows.append([("📥 Ведомость за месяц (Excel)", f"a:xl:{ym}")])
+    rows.append([("« Все месяцы", "a:sl:0")])
+    await show(callback, "\n".join(lines), kb(*rows))
 
 
 def session_card(db: Database, session: Session) -> str:
@@ -331,7 +392,7 @@ async def show_session(target: Message | CallbackQuery, db: Database, session_id
         [("✏️ Исправить отметки", f"a:se:{session.id}:0")],
         [toggle, ("🔄 Обновить", f"a:s:{session.id}")],
         [("🗑 Удалить занятие", f"a:sd:{session.id}")],
-        [("« К списку занятий", "a:sl:0")],
+        [(f"« {month_title(session.date[:7])}", f"a:ml:{session.date[:7]}:0")],
     )
     await show(target, session_card(db, session), markup)
 
@@ -384,7 +445,9 @@ async def session_delete(callback: CallbackQuery, bot: Bot, db: Database) -> Non
             except TelegramBadRequest:
                 pass
         db.delete_session(session.id)
-    await show_sessions_list(callback, db, 0)
+        await show_month(callback, db, session.date[:7], 0)
+        return
+    await show_months(callback, db)
 
 
 @router.callback_query(F.data.startswith("a:se:"))
@@ -440,11 +503,13 @@ async def session_toggle_mark(callback: CallbackQuery, bot: Bot, db: Database) -
 # ---------- студенты ----------
 
 @router.callback_query(F.data.startswith("a:stl:"))
-async def students_list(callback: CallbackQuery, db: Database) -> None:
-    await show_students_list(callback, db, int(callback.data.split(":")[2]))
+async def students_list(callback: CallbackQuery, db: Database, config: Config) -> None:
+    await show_students_list(callback, db, int(callback.data.split(":")[2]), config)
 
 
-async def show_students_list(callback: CallbackQuery, db: Database, page: int) -> None:
+async def show_students_list(
+    callback: CallbackQuery, db: Database, page: int, config: Config | None = None
+) -> None:
     fmt = db.get("name_format")
     students = db.list_students(include_inactive=True)
     students.sort(key=lambda s: (not s.counted, s.name.lower()))
@@ -473,6 +538,13 @@ async def show_students_list(callback: CallbackQuery, db: Database, page: int) -
             "Список пуст. Нажмите «🔄 Считать участников чата» — или студенты появятся "
             "после первого нажатия кнопки / регистрации."
         )
+    if config is not None and not config.can_read_members:
+        lines += [
+            "",
+            "ℹ️ Чтобы бот сам подтянул <b>всех</b> участников чата без их действий, "
+            "добавьте на сервере ключи API_ID и API_HASH (инструкция — в README, "
+            "раздел «Получите API_ID и API_HASH») и нажмите «🔄 Считать участников чата».",
+        ]
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:3990] + "\n…"
@@ -515,7 +587,7 @@ async def members_sync(callback: CallbackQuery, bot: Bot, db: Database, config: 
         return
     result = await sync_members(bot, db, config)
     await callback.message.answer(sync_report(result, db, config))
-    await show_students_list(callback, db, 0)
+    await show_students_list(callback, db, 0, config)
 
 
 async def show_student(target: Message | CallbackQuery, db: Database, uid: int) -> None:
@@ -545,6 +617,23 @@ async def show_student(target: Message | CallbackQuery, db: Database, uid: int) 
         f"😷 Болел: {len(sick)}",
         f"❌ Пропустил без причины: {len(missed)}",
     ]
+    months: dict[str, list[int]] = {}
+    for s in sessions:
+        m = months.setdefault(s.date[:7], [0, 0, 0, 0])  # занятий, был, болел, н
+        m[0] += 1
+        if s.id in attended:
+            m[1] += 1
+        elif s in sick:
+            m[2] += 1
+        else:
+            m[3] += 1
+    if len(months) > 0:
+        lines += ["", "По месяцам:"]
+        for ym, (total, was, ill, absent) in list(months.items())[:6]:
+            lines.append(
+                f"• {month_title(ym)}: {was}/{total} ({pct(was, total)})"
+                + (f", 😷 {ill}" if ill else "") + (f", н: {absent}" if absent else "")
+            )
     if missed:
         lines.append("")
         lines.append("Последние пропуски:")
@@ -1017,7 +1106,8 @@ async def show_settings(target: Message | CallbackQuery, db: Database) -> None:
         f"🛡 Защита: {protection_summary(db)}\n\n"
         f"🏷 Формат имён: {name_text}\n"
         f"↕️ Сортировка «кто был»: {sort_text}\n"
-        f"🌍 Часовой пояс: {esc(db.get('timezone'))}"
+        f"🌍 Часовой пояс: {esc(db.get('timezone'))}\n"
+        f"🏫 Группа (для ведомости): {esc(db.get('group_name') or '—')}"
     )
     markup = kb(
         [("📝 Текст сообщения и кнопки", "a:setm")],
@@ -1031,7 +1121,7 @@ async def show_settings(target: Message | CallbackQuery, db: Database) -> None:
         [(f"{on_off(db.get_bool('pin_message'))} Закреплять", "a:sett:pin_message"),
          (f"{on_off(db.get_bool('notify_on_close'))} Итог мне", "a:sett:notify_on_close")],
         [(f"🏷 Имена: {name_text}", "a:setn"), (f"↕️ {sort_text}", "a:sets")],
-        [("🌍 Часовой пояс", "a:seti:timezone")],
+        [("🏫 Название группы", "a:seti:group_name"), ("🌍 Часовой пояс", "a:seti:timezone")],
         BACK_TO_MENU,
     )
     await show(target, text, markup)
@@ -1315,6 +1405,9 @@ INPUT_PROMPTS = {
     "sick_button": (Input.sick_button, "a:setm",
                     "Отправьте новый текст кнопки больничного (до 40 символов).\n"
                     "Например: <code>🤒 Болею</code> или <code>➕ На больничном</code>"),
+    "group_name": (Input.group_name, "a:set",
+                   "Отправьте название группы — оно будет в левом верхнем углу ведомости.\n"
+                   "Например: <code>УФРС24-2</code>"),
     "timezone": (Input.timezone, "a:set",
                  "Отправьте часовой пояс в формате IANA, например:\n"
                  "<code>Europe/Moscow</code>, <code>Asia/Yekaterinburg</code>, "
@@ -1364,6 +1457,13 @@ async def settings_sick_button(message: Message, bot: Bot, db: Database, state: 
     await show_message_settings(message, db)
 
 
+@router.message(Input.group_name, F.text)
+async def settings_group_name(message: Message, db: Database, state: FSMContext) -> None:
+    db.set("group_name", message.text.strip()[:60])
+    await state.clear()
+    await show_settings(message, db)
+
+
 @router.message(Input.timezone, F.text)
 async def settings_timezone(message: Message, db: Database, state: FSMContext) -> None:
     tz = message.text.strip()
@@ -1380,62 +1480,39 @@ async def settings_timezone(message: Message, db: Database, state: FSMContext) -
 
 # ---------- выгрузка ----------
 
-@router.callback_query(F.data == "a:csv")
-async def export_csv(callback: CallbackQuery, db: Database) -> None:
-    sessions = list(reversed(db.list_sessions()))
-    students = db.list_students()
-    fmt = db.get("name_format")
-    marks = {s.id: db.marks(s.id) for s in sessions}
-
-    buf = io.StringIO()
-    writer = csv.writer(buf, delimiter=";")
-    leaves = db.sick_days_by_user()
-    writer.writerow(
-        ["Студент"]
-        + [fmt_date(s.date) + (f" {s.time}" if s.time else "") for s in sessions]
-        + ["Посетил", "Болел", "Пропустил без причины", "% посещения"]
+@router.callback_query(F.data == "a:xl")
+async def export_menu(callback: CallbackQuery, db: Database) -> None:
+    months = db.list_months()
+    rows: list[Row] = [[(f"📅 {month_title(ym)}", f"a:xl:{ym}")] for ym, _ in months[:12]]
+    if len(months) > 1:
+        rows.append([("📚 Все месяцы (каждый на своём листе)", "a:xl:all")])
+    rows.append(BACK_TO_MENU)
+    text = (
+        "📥 <b>Ведомость в Excel</b>\n\n"
+        "Формат как в журнале: ФИО, числа месяца, «н» — не был, «б» — болел "
+        "(с заливкой), пустая клетка — был, в конце «ИТОГО» — число «н».\n"
+        "Отдельный лист — список всех больничных.\n\n"
+        f"Название группы в таблице: <b>{esc(db.get('group_name') or 'Группа')}</b> "
+        "(меняется в ⚙️ Настройки)."
     )
-    for st in students:
-        row = [student_name(st, fmt)]
-        n = ill = 0
-        for s in sessions:
-            if st.user_id in marks[s.id]:
-                n += 1
-                row.append("+")
-            elif sick_on(leaves, st.user_id, s.date):
-                ill += 1
-                row.append("б")
-            else:
-                row.append("н")
-        row += [n, ill, len(sessions) - n - ill, pct(n, len(sessions))]
-        writer.writerow(row)
-    writer.writerow(
-        ["Итого присутствовало"]
-        + [sum(1 for st in students if st.user_id in marks[s.id]) for s in sessions]
-    )
+    if not months:
+        text += "\n\nПока ни одной отметки не было."
+    await show(callback, text, kb(*rows))
 
-    # отдельный блок со всеми больничными
-    all_leaves = db.list_sick_leaves()
-    if all_leaves:
-        writer.writerow([])
-        writer.writerow(["Больничные"])
-        writer.writerow(["Студент", "С", "По", "Дней", "Кто указал", "Записано"])
-        for lv in sorted(all_leaves, key=lambda x: (x.start, x.user_id)):
-            st = db.get_student(lv.user_id)
-            days = (date.fromisoformat(lv.end) - date.fromisoformat(lv.start)).days + 1
-            writer.writerow([
-                student_name(st, fmt) if st else lv.user_id,
-                fmt_date(lv.start), fmt_date(lv.end), days,
-                "староста" if lv.by_admin else "сам студент",
-                f"{to_local(db, lv.created_at):%d.%m.%Y %H:%M}",
-            ])
 
-    data = ("﻿" + buf.getvalue()).encode("utf-8")  # BOM, чтобы Excel понял кириллицу
-    name = f"poseshaemost_{now_local(db):%Y-%m-%d}.csv"
+@router.callback_query(F.data.startswith("a:xl:"))
+async def export_excel(callback: CallbackQuery, db: Database) -> None:
+    which = callback.data.split(":")[2]
+    months = None if which == "all" else [which]
+    data = build_workbook(db, months)
+    group = (db.get("group_name") or "vedomost").replace(" ", "_")
+    period = "vse_mesyacy" if months is None else which
     await callback.message.answer_document(
-        BufferedInputFile(data, filename=name),
-        caption="📥 Таблица посещаемости: «+» — был, «б» — болел, «н» — не был. "
-                "Внизу — список всех больничных. Открывается в Excel.",
+        BufferedInputFile(data, filename=f"{group}_{period}.xlsx"),
+        caption=(
+            f"📥 Ведомость{'' if months is None else ' за ' + month_title(which).lower()}.\n"
+            "«н» — не был, «б» — болел, пусто — был."
+        ),
     )
     await callback.answer()
 
