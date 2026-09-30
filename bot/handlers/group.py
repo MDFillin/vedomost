@@ -24,23 +24,65 @@ router.chat_member.filter(F.chat.type.in_(GROUP_TYPES))
 debouncer = RefreshDebouncer()
 
 
-async def bind_and_sync(bot: Bot, db: Database, config: Config, chat_id: int, title: str) -> str:
+def topic_of(message: Message) -> tuple[int | None, str | None]:
+    """Тема форума, в которой написано сообщение: (id, название) или (None, None)."""
+    if not message.is_topic_message or not message.message_thread_id:
+        return None, None
+    name = None
+    reply = message.reply_to_message
+    if reply and reply.forum_topic_created:
+        name = reply.forum_topic_created.name
+    return message.message_thread_id, name
+
+
+async def bind_and_sync(bot: Bot, db: Database, config: Config, chat_id: int, title: str,
+                        thread_id: int | None = None, topic: str | None = None) -> str:
     db.set("group_chat_id", chat_id)
+    db.set("group_thread_id", thread_id or "")
+    if thread_id:
+        place = f"«{title}» → тема «{topic}»" if topic else f"«{title}» → тема #{thread_id}"
+    else:
+        place = f"«{title}»"
+    db.set("group_title", place)
     if not db.get("group_name") and title:
         db.set("group_name", title)  # название для ведомости, можно поменять в настройках
     result = await sync_members(bot, db, config)
-    return f"✅ Чат «{esc(title)}» привязан.\n\n" + sync_report(result, db, config)
+    return f"✅ Отметки будут приходить в {esc(place)}.\n\n" + sync_report(result, db, config)
 
 
 # ---------- привязка ----------
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=JOIN_TRANSITION))
 async def bot_added(event: ChatMemberUpdated, bot: Bot, db: Database, config: Config) -> None:
-    """Бота добавили в чат: если это сделал староста — сразу привязываемся и считываем всех."""
+    """Бота добавили в чат: если это сделал староста — привязываемся и считываем всех.
+
+    Автоматически привязываемся только к первому чату: если бот уже где-то работает,
+    добавление в другой чат сообщества ничего не переключит — только /bind.
+    """
     title = event.chat.title or str(event.chat.id)
-    if event.from_user.id in config.admin_ids:
-        report = await bind_and_sync(bot, db, config, event.chat.id, title)
-        await notify_admins(bot, config.admin_ids, report)
+    if event.from_user.id not in config.admin_ids:
+        await notify_admins(
+            bot, config.admin_ids,
+            f"ℹ️ Меня добавил в чат «{esc(title)}» пользователь {esc(event.from_user.full_name)}.\n"
+            "Если это ваша группа — отправьте в том чате /bind.",
+        )
+        return
+    if db.group_chat_id is not None and db.group_chat_id != event.chat.id:
+        await notify_admins(
+            bot, config.admin_ids,
+            f"ℹ️ Меня добавили в чат «{esc(title)}», но отметки по-прежнему приходят в "
+            f"{esc(db.get('group_title') or 'привязанный чат')}.\n"
+            "Чтобы переключить — отправьте /bind в нужном чате (или нужной теме).",
+        )
+        return
+    report = await bind_and_sync(bot, db, config, event.chat.id, title)
+    if event.chat.is_forum:
+        report += (
+            "\n\n🗂 Это чат с темами. Сейчас отметки будут приходить в тему «Общее». "
+            "Чтобы бот писал в конкретную тему — откройте её и отправьте там /bind."
+        )
+    await notify_admins(bot, config.admin_ids, report)
+    if not event.chat.is_forum:
         try:
             await bot.send_message(
                 event.chat.id,
@@ -49,12 +91,6 @@ async def bot_added(event: ChatMemberUpdated, bot: Bot, db: Database, config: Co
             )
         except Exception:
             pass
-    else:
-        await notify_admins(
-            bot, config.admin_ids,
-            f"ℹ️ Меня добавил в чат «{esc(title)}» пользователь {esc(event.from_user.full_name)}.\n"
-            "Если это ваша группа — отправьте в том чате /bind.",
-        )
 
 
 @router.my_chat_member(ChatMemberUpdatedFilter(member_status_changed=LEAVE_TRANSITION))
@@ -72,9 +108,14 @@ async def bind_group(message: Message, bot: Bot, db: Database, config: Config) -
     if not message.from_user or message.from_user.id not in config.admin_ids:
         await message.reply("Привязать бота к чату может только староста.")
         return
-    report = await bind_and_sync(bot, db, config, message.chat.id, message.chat.title or "")
+    thread_id, topic = topic_of(message)
+    report = await bind_and_sync(
+        bot, db, config, message.chat.id, message.chat.title or "", thread_id, topic
+    )
+    where = "в эту тему" if thread_id else "в этот чат"
     await message.reply(
-        "✅ Этот чат привязан. Сюда будут приходить сообщения для отметки посещаемости."
+        f"✅ Готово! Сообщения для отметки посещаемости будут приходить {where}. "
+        "В другие чаты и темы я писать не буду."
     )
     await notify_admins(bot, config.admin_ids, report)
 
@@ -85,6 +126,8 @@ async def unbind_group(message: Message, db: Database, config: Config) -> None:
         return
     if db.group_chat_id == message.chat.id:
         db.set("group_chat_id", "")
+        db.set("group_thread_id", "")
+        db.set("group_title", "")
         await message.reply("Чат отвязан. Отметки сюда больше приходить не будут.")
 
 

@@ -216,7 +216,8 @@ async def show_menu(target: Message | CallbackQuery, db: Database) -> None:
     nxt = next_slot(db, now)
     lines = ["🎓 <b>Панель старосты</b>", ""]
     if chat_id:
-        lines.append(f"💬 Группа привязана (ID <code>{chat_id}</code>)")
+        where = esc(db.get("group_title")) or f"ID <code>{chat_id}</code>"
+        lines.append(f"💬 Отметки приходят в: <b>{where}</b>")
     else:
         lines.append("⚠️ Группа не привязана — добавьте бота в чат и отправьте там /bind")
     lines.append(f"👥 Студентов в списке: {len(db.list_students())}")
@@ -736,7 +737,8 @@ async def registration_send(callback: CallbackQuery, bot: Bot, db: Database) -> 
     try:
         await bot.send_message(
             db.group_chat_id,
-            "🙋 <b>Регистрация в списке группы</b>\n\n"
+            message_thread_id=db.group_thread_id,
+            text="🙋 <b>Регистрация в списке группы</b>\n\n"
             "Нажмите кнопку ниже, чтобы староста видел вас в журнале посещаемости.",
             reply_markup=kb([("🙋 Я в группе", "register")]),
         )

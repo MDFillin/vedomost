@@ -452,7 +452,7 @@ async def test_bot_added_auto_binds_and_reads_members(env, monkeypatch):
     assert db.group_chat_id == GROUP
     assert len(db.list_students()) == 4
     report = [m.text for m in session.of(SendMessage) if m.chat_id == ADMIN][-1]
-    assert "привязан" in report and "<b>4</b>" in report
+    assert "Отметки будут приходить в «ИВТ-21»" in report and "<b>4</b>" in report
 
     # кто-то вышел — после повторной сверки он не считается
     async def fake_fetch2(config, chat_id):
@@ -659,3 +659,52 @@ def test_old_default_text_migrates():
     db.set("message_text", "📅 {день}, {дата}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇")
     db._migrate()
     assert db.get("message_text") == "Если вы на занятии — нажмите кнопку ниже 👇"
+
+
+# ---------- сообщество: несколько чатов и темы ----------
+
+async def test_bind_to_forum_topic(env):
+    db, bot, dp, session = env
+    topic_created = Message(
+        message_id=77, date=datetime.now(), chat=Chat(id=GROUP, type="supergroup", is_forum=True),
+        forum_topic_created={"name": "Посещаемость", "icon_color": 0},
+    )
+    msg = Message(
+        message_id=next(_uid), date=datetime.now(),
+        chat=Chat(id=GROUP, type="supergroup", title="Сообщество ИВТ", is_forum=True),
+        from_user=user(ADMIN), text="/bind", message_thread_id=77, is_topic_message=True,
+        reply_to_message=topic_created,
+    )
+    await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
+    assert db.group_chat_id == GROUP and db.group_thread_id == 77
+    assert db.get("group_title") == "«Сообщество ИВТ» → тема «Посещаемость»"
+
+    s = await send_session(bot, db, date.today(), "10:00")
+    sent = session.of(SendMessage)[-1]
+    assert sent.chat_id == GROUP and sent.message_thread_id == 77
+
+    await press(dp, bot, 201, f"mark:{s.id}", GROUP, "Иван Иванов")
+    assert "записано" in last_alert(session)
+
+    # /bind в «Общем» (без темы) переключает обратно на весь чат
+    await text(dp, bot, ADMIN, "/bind", GROUP, "supergroup")
+    assert db.group_thread_id is None
+
+
+async def test_adding_bot_to_second_chat_does_not_rebind(env):
+    db, bot, dp, session = env
+    me = User(id=42, is_bot=True, first_name="bot")
+    await dp.feed_update(bot, Update(update_id=next(_uid),
+                                     my_chat_member=member_update(GROUP, ADMIN, "left", "member", me)))
+    assert db.group_chat_id == GROUP
+    await dp.feed_update(bot, Update(update_id=next(_uid),
+                                     my_chat_member=member_update(-2002, ADMIN, "left", "member", me)))
+    assert db.group_chat_id == GROUP
+    assert "по-прежнему" in [m.text for m in session.of(SendMessage) if m.chat_id == ADMIN][-1]
+
+    # сообщения и кнопки из другого чата сообщества не влияют ни на что
+    s = await send_session(bot, db, date.today(), "10:00")
+    await press(dp, bot, 201, f"mark:{s.id}", -2002, "Иван Иванов")
+    assert "только в чате группы" in last_alert(session)
+    await text(dp, bot, 305, "привет", -2002, "supergroup")
+    assert db.get_student(305) is None

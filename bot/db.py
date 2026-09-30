@@ -73,6 +73,8 @@ OLD_DEFAULT_TEXTS = {
 
 DEFAULT_SETTINGS: dict[str, str] = {
     "group_chat_id": "",
+    "group_thread_id": "",   # тема (топик) в чате-форуме; пусто — обычный чат / «Общее»
+    "group_title": "",       # название чата и темы — для панели старосты
     "group_name": "",        # название группы для ведомости (по умолчанию — название чата)
     "timezone": "",
     "title": "Отметка посещаемости",  # HTML
@@ -222,6 +224,11 @@ class Database:
         new = not self.get_bool(key)
         self.set(key, new)
         return new
+
+    @property
+    def group_thread_id(self) -> int | None:
+        raw = self.get("group_thread_id")
+        return int(raw) if raw else None
 
     @property
     def group_chat_id(self) -> int | None:

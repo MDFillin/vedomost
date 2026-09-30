@@ -229,6 +229,7 @@ async def send_session(
             group_text(db, session),
             reply_markup=group_keyboard(db, session),
             protect_content=db.get_bool("protect_content"),
+            message_thread_id=db.group_thread_id,
         )
     except Exception:
         db.delete_session(session.id)
