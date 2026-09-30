@@ -1,6 +1,7 @@
 """Админ-панель старосты в личных сообщениях с ботом."""
 
 import logging
+import io
 from datetime import date, timedelta
 
 from aiogram import Bot, F, Router
@@ -17,6 +18,14 @@ from aiogram.types import (
     Message,
 )
 
+from ..backup import (
+    BACKUP_MODES,
+    RestoreError,
+    describe_schedule,
+    inspect_backup,
+    restore_database,
+    send_backup,
+)
 from ..config import Config
 from ..excel import build_workbook, month_title
 from ..stats import ABSENT, PRESENT, SICK, session_statuses, student_statuses, totals
@@ -81,6 +90,8 @@ class Input(StatesGroup):
     button = State()
     timezone = State()
     rename = State()
+    backup_time = State()
+    restore = State()
 
 
 # ---------- helpers ----------
@@ -250,7 +261,7 @@ async def show_menu(target: Message | CallbackQuery, db: Database) -> None:
         [("👥 Студенты и сводка", "a:stl:0"), ("😷 Больничные", "a:sick")],
         [("🗓 Расписание", "a:sch"), ("⚙️ Настройки", "a:set")],
         [("📤 Отправить отметку сейчас", "a:send")],
-        [("📥 Ведомость в Excel", "a:xl")],
+        [("📥 Ведомость в Excel", "a:xl"), ("💾 Резервные копии", "a:bk")],
     ]
     await show(target, "\n".join(lines), kb(*rows))
 
@@ -1521,6 +1532,158 @@ async def export_excel(callback: CallbackQuery, db: Database) -> None:
         ),
     )
     await callback.answer()
+
+
+# ---------- резервные копии ----------
+
+async def show_backups(target: Message | CallbackQuery, db: Database) -> None:
+    last = db.get("backup_last")
+    last_text = f"{to_local(db, last):%d.%m.%Y %H:%M}" if last else "ещё не было"
+    mode = db.get("backup_mode")
+
+    def mark(key: str, text: str) -> tuple[str, str]:
+        return (("• " if key == mode else "") + text, f"a:bkm:{key}")
+
+    rows: list[Row] = [
+        [("📤 Сделать копию сейчас", "a:bknow")],
+        [mark("daily", "Каждый день"), mark("weekly", "Раз в неделю"), mark("off", "Выкл")],
+        [(f"🕐 Время: {db.get('backup_time')}", "a:bkt")]
+        + ([(f"📅 {WEEKDAYS_SHORT[db.get_int('backup_weekday')]}", "a:bkd")]
+           if mode == "weekly" else []),
+        [("♻️ Восстановить из копии", "a:bkr")],
+        BACK_TO_MENU,
+    ]
+    await show(
+        target,
+        "💾 <b>Резервные копии</b>\n\n"
+        f"Автоматически: <b>{describe_schedule(db)}</b>\n"
+        f"Последняя копия: {last_text}\n\n"
+        "Копия приходит сюда, в личку, двумя файлами:\n"
+        "• <b>.db</b> — полная база (студенты, занятия, пропуски, больничные, настройки). "
+        "Из неё бот восстанавливается одной кнопкой.\n"
+        "• <b>.xlsx</b> — ведомость, чтобы данные можно было прочитать и без бота.\n\n"
+        "Даже если сервер сломается, с последней копией бот поднимется на новом сервере "
+        "со всей историей.",
+        kb(*rows),
+    )
+
+
+@router.callback_query(F.data == "a:bk")
+async def backups_view(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    await state.clear()
+    await show_backups(callback, db)
+
+
+@router.callback_query(F.data == "a:bknow")
+async def backup_now(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    await callback.answer("Готовлю копию…")
+    # копию шлём только тому, кто нажал, — остальным старостам не спамим
+    await send_backup(bot, db, frozenset({callback.from_user.id}), "по запросу")
+    await callback.message.answer("✅ Копия выше. Сохраните файл .db.")
+
+
+@router.callback_query(F.data.startswith("a:bkm:"))
+async def backup_mode(callback: CallbackQuery, db: Database) -> None:
+    mode = callback.data.split(":")[2]
+    if mode in BACKUP_MODES:
+        db.set("backup_mode", mode)
+    await show_backups(callback, db)
+
+
+@router.callback_query(F.data == "a:bkd")
+async def backup_weekday_menu(callback: CallbackQuery, db: Database) -> None:
+    days = [(WEEKDAYS_SHORT[i], f"a:bkd:{i}") for i in range(7)]
+    await show(callback, "В какой день недели присылать копию?",
+               kb(days[:4], days[4:], [("« Назад", "a:bk")]))
+
+
+@router.callback_query(F.data.startswith("a:bkd:"))
+async def backup_weekday_set(callback: CallbackQuery, db: Database) -> None:
+    db.set("backup_weekday", int(callback.data.split(":")[2]) % 7)
+    await show_backups(callback, db)
+
+
+@router.callback_query(F.data == "a:bkt")
+async def backup_time_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Input.backup_time)
+    await show(callback, "Во сколько присылать копию? Например, <code>23:00</code>.",
+               kb([("✖️ Отмена", "a:bk")]))
+
+
+@router.message(Input.backup_time, F.text)
+async def backup_time_set(message: Message, db: Database, state: FSMContext) -> None:
+    t = parse_time(message.text)
+    if t is None:
+        await message.answer("Не понял время 🤔 Пример: <code>23:00</code>",
+                             reply_markup=kb([("✖️ Отмена", "a:bk")]))
+        return
+    db.set("backup_time", t)
+    await state.clear()
+    await show_backups(message, db)
+
+
+@router.callback_query(F.data == "a:bkr")
+async def restore_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Input.restore)
+    await show(
+        callback,
+        "♻️ <b>Восстановление</b>\n\n"
+        "Отправьте сюда файл резервной копии (<b>.db</b>) — тот, что присылал бот.\n\n"
+        "Перед заменой я покажу, что в файле, и пришлю копию текущих данных — "
+        "так ничего не потеряется, даже если выбрать не тот файл.",
+        kb([("✖️ Отмена", "a:bk")]),
+    )
+
+
+async def download(bot: Bot, file_id: str) -> bytes:
+    buf = io.BytesIO()
+    await bot.download(file_id, destination=buf)
+    return buf.getvalue()
+
+
+@router.message(Input.restore, F.document)
+async def restore_file(message: Message, bot: Bot, state: FSMContext) -> None:
+    doc = message.document
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+        await message.answer("Файл слишком большой (Telegram даёт ботам скачать до 20 МБ).")
+        return
+    try:
+        info = inspect_backup(await download(bot, doc.file_id))
+    except RestoreError as e:
+        await message.answer(f"⛔ {e}\nОтправьте файл .db из резервной копии бота.",
+                             reply_markup=kb([("✖️ Отмена", "a:bk")]))
+        return
+    await state.update_data(restore_file=doc.file_id)
+    await message.answer(
+        f"В файле <b>{esc(doc.file_name or 'копия')}</b>: {info}.\n\n"
+        "⚠️ Текущие данные бота будут <b>заменены</b> данными из файла. "
+        "Копию текущих данных я пришлю перед заменой.",
+        reply_markup=kb([("♻️ Да, восстановить", "a:bkry")], [("✖️ Отмена", "a:bk")]),
+    )
+
+
+@router.message(Input.restore)
+async def restore_not_file(message: Message) -> None:
+    await message.answer("Нужен файл .db — отправьте его как документ (скрепка → Файл).",
+                         reply_markup=kb([("✖️ Отмена", "a:bk")]))
+
+
+@router.callback_query(F.data == "a:bkry")
+async def restore_confirm(callback: CallbackQuery, bot: Bot, db: Database, state: FSMContext) -> None:
+    file_id = (await state.get_data()).get("restore_file")
+    await state.clear()
+    if not file_id:
+        await callback.answer("Сначала отправьте файл копии", show_alert=True)
+        return
+    await callback.answer("Восстанавливаю…")
+    await send_backup(bot, db, frozenset({callback.from_user.id}), "перед восстановлением")
+    try:
+        summary = restore_database(db, await download(bot, file_id))
+    except RestoreError as e:
+        await callback.message.answer(f"⛔ Не получилось: {e}. Данные не изменились.")
+        return
+    await callback.message.answer(f"✅ Данные восстановлены: {summary}.")
+    await show_menu(callback.message, db)
 
 
 # ---------- ввод не того типа ----------

@@ -799,3 +799,133 @@ def test_migration_from_presence_logic(tmp_path):
     db2 = Database(path)  # повторный запуск ничего не меняет
     assert set(db2.absences(s.id)) == {202, 203}
     assert sqlite3.connect(path).execute("SELECT value FROM settings WHERE key='logic'").fetchone()
+
+
+# ---------- резервные копии ----------
+
+from bot import backup as backup_mod  # noqa: E402
+
+
+def filled_db(path=":memory:") -> Database:
+    db = Database(path)
+    for uid, name in STUDENTS:
+        db.upsert_student(uid, name, None)
+    s = db.create_session(GROUP, "2026-09-30", "10:00", None, None)
+    db.mark_absent(s.id, 201)
+    db.add_sick_leave(202, "2026-09-29", "2026-10-02")
+    db.set("group_name", "УФРС24-2")
+    return db
+
+
+def test_backup_roundtrip(tmp_path):
+    db = filled_db(str(tmp_path / "bot.db"))
+    data = backup_mod.dump_database(db)
+    assert "студентов: 3, занятий: 1" in backup_mod.inspect_backup(data)
+
+    # всё сломали…
+    db.delete_student(201)
+    db.delete_session(1)
+    db.set("group_name", "мусор")
+    # …и восстановили
+    summary = backup_mod.restore_database(db, data)
+    assert "занятий: 1, пропусков: 1, больничных: 1" in summary
+    assert set(db.absences(1)) == {201}
+    assert db.get("group_name") == "УФРС24-2"
+
+
+def test_restore_rejects_bad_files(tmp_path):
+    db = filled_db()
+    with pytest.raises(backup_mod.RestoreError, match="не файл"):
+        backup_mod.restore_database(db, b"hello")
+    import sqlite3
+    other = tmp_path / "other.db"
+    c = sqlite3.connect(other)
+    c.execute("CREATE TABLE t (x)")
+    c.commit()
+    c.close()
+    with pytest.raises(backup_mod.RestoreError, match="нет данных"):
+        backup_mod.restore_database(db, other.read_bytes())
+    assert len(db.list_students()) == 3  # данные не тронуты
+
+
+def test_backup_schedule():
+    db = Database(":memory:")
+    tz = get_tz(db)
+    wed_2300 = datetime(2026, 9, 30, 23, 0, tzinfo=tz)
+    assert not backup_mod.backup_due(db, wed_2300 - timedelta(minutes=1))
+    assert backup_mod.backup_due(db, wed_2300)
+    db.set("backup_last", wed_2300.isoformat())
+    assert not backup_mod.backup_due(db, wed_2300 + timedelta(minutes=30))
+    assert backup_mod.backup_due(db, wed_2300 + timedelta(days=1))
+    db.set("backup_mode", "weekly")
+    db.set("backup_weekday", 6)
+    assert not backup_mod.backup_due(db, wed_2300 + timedelta(days=1))  # четверг
+    assert backup_mod.backup_due(db, wed_2300 + timedelta(days=4))  # воскресенье
+    db.set("backup_mode", "off")
+    assert not backup_mod.backup_due(db, wed_2300 + timedelta(days=4))
+
+
+async def test_backup_panel_and_restore(env, monkeypatch):
+    db, bot, dp, session = env
+    for uid, name in STUDENTS:
+        db.upsert_student(uid, name, None)
+    s = db.create_session(GROUP, "2026-09-30", "10:00", None, None)
+    db.mark_absent(s.id, 203)
+
+    # копия по кнопке: .db и .xlsx только тому, кто нажал
+    await press(dp, bot, ADMIN, "a:bknow", ADMIN)
+    docs = session.of(SendDocument)[-2:]
+    assert [d.document.filename.rsplit(".", 1)[1] for d in docs] == ["db", "xlsx"]
+    assert all(d.chat_id == ADMIN for d in docs)
+    saved = docs[0].document.data
+    assert db.get("backup_last")
+
+    # настройки расписания
+    await press(dp, bot, ADMIN, "a:bkm:weekly", ADMIN)
+    await press(dp, bot, ADMIN, "a:bkd:2", ADMIN)
+    await press(dp, bot, ADMIN, "a:bkt", ADMIN)
+    await text(dp, bot, ADMIN, "21:30")
+    assert (db.get("backup_mode"), db.get("backup_weekday"), db.get("backup_time")) == (
+        "weekly", "2", "21:30")
+
+    # данные испортились — восстанавливаем из присланного файла
+    db.delete_session(s.id)
+    files = {"good": saved, "bad": b"not a db"}
+
+    async def fake_download(file, destination):
+        destination.write(files[file])
+
+    monkeypatch.setattr(bot, "download", fake_download)
+
+    async def send_file(file_id: str):
+        doc = {"file_id": file_id, "file_unique_id": file_id, "file_name": "backup.db",
+               "file_size": 1000}
+        msg = Message(message_id=next(_uid), date=datetime.now(), chat=Chat(id=ADMIN, type="private"),
+                      from_user=user(ADMIN), document=doc)
+        await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
+
+    await press(dp, bot, ADMIN, "a:bkr", ADMIN)
+    await send_file("bad")
+    assert "не файл" in session.of(SendMessage)[-1].text
+    await send_file("good")
+    assert "занятий: 1" in session.of(SendMessage)[-1].text
+    assert db.count_sessions() == 0  # до подтверждения ничего не меняем
+    before = len(session.of(SendDocument))
+    await press(dp, bot, ADMIN, "a:bkry", ADMIN)
+    assert len(session.of(SendDocument)) == before + 2  # сначала копия текущих данных
+    assert db.count_sessions() == 1 and set(db.absences(s.id)) == {203}
+    assert any("восстановлены" in (m.text or "") for m in session.of(SendMessage))
+
+
+async def test_scheduler_sends_backup_once(env, monkeypatch):
+    from bot import scheduler
+
+    db, bot, dp, session = env
+    config = dp["config"]
+    tz = get_tz(db)
+    fixed = datetime(2026, 9, 30, 23, 5, tzinfo=tz)
+    monkeypatch.setattr(scheduler, "now_local", lambda _db: fixed)
+    monkeypatch.setattr(backup_mod, "now_local", lambda _db: fixed)
+    await scheduler.tick(bot, db, config, set())
+    await scheduler.tick(bot, db, config, set())
+    assert len([d for d in session.of(SendDocument) if d.document.filename.endswith(".db")]) == 1

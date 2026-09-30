@@ -111,6 +111,10 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "sick_button": "1",      # показывать кнопку «Я болею»
     "sick_button_text": "😷 Я болею",
     "notify_sick": "1",      # сообщать старосте о новых больничных
+    "backup_mode": "daily",  # daily | weekly | off — резервная копия старосте в личку
+    "backup_time": "23:00",
+    "backup_weekday": "6",   # для weekly, 0 = понедельник
+    "backup_last": "",       # когда отправлена последняя копия (ISO)
 }
 
 
@@ -178,11 +182,16 @@ class Database:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
+        self.default_tz = default_tz
+        self.upgrade()
+
+    def upgrade(self) -> None:
+        """Создаёт недостающие таблицы и настройки, переносит данные старых версий."""
         self.conn.executescript(SCHEMA)
         self._migrate()
         for key, value in DEFAULT_SETTINGS.items():
             if key == "timezone":
-                value = default_tz
+                value = self.default_tz
             self.conn.execute(
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value)
             )

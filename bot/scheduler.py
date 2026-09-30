@@ -5,6 +5,7 @@ import logging
 
 from aiogram import Bot
 
+from .backup import backup_due, send_backup
 from .config import Config
 from .db import Database
 from .members import sync_members
@@ -53,6 +54,13 @@ async def tick(bot: Bot, db: Database, config: Config, failed: set[str]) -> None
             await close_session(bot, db, session, admin_ids)
         except Exception:
             log.exception("Ошибка при закрытии занятия %s", session.id)
+
+    if backup_due(db, now):
+        try:
+            await send_backup(bot, db, admin_ids, "по расписанию")
+        except Exception:
+            log.exception("Не удалось сделать резервную копию")
+            db.set("backup_last", now.isoformat())  # не повторять каждые 20 секунд
 
 
 async def run_scheduler(bot: Bot, db: Database, config: Config) -> None:
