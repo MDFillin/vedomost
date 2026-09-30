@@ -135,7 +135,7 @@ async def unbind_group(message: Message, db: Database, config: Config) -> None:
 async def group_migrated(message: Message, db: Database) -> None:
     # Группа превратилась в супергруппу — у неё меняется ID.
     if db.group_chat_id == message.chat.id:
-        db.set("group_chat_id", message.migrate_to_chat_id)
+        db.migrate_chat(message.chat.id, message.migrate_to_chat_id)
         log.info("Группа мигрировала: %s -> %s", message.chat.id, message.migrate_to_chat_id)
 
 

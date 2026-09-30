@@ -1,5 +1,6 @@
 """Админ-панель старосты в личных сообщениях с ботом."""
 
+import logging
 from datetime import date, timedelta
 
 from aiogram import Bot, F, Router
@@ -55,6 +56,8 @@ from ..utils import (
     to_local,
 )
 
+log = logging.getLogger(__name__)
+
 router = Router(name="admin")
 router.message.filter(F.chat.type == "private")
 router.callback_query.filter(F.message.chat.type == "private")
@@ -106,7 +109,10 @@ async def show(target: Message | CallbackQuery, text: str, markup: InlineKeyboar
         except TelegramBadRequest as e:
             if "not modified" not in str(e):
                 await target.message.answer(text, reply_markup=markup)
-        await target.answer()
+        try:
+            await target.answer()
+        except TelegramBadRequest:
+            pass  # на нажатие уже ответили (например, всплывающим сообщением)
     else:
         await target.answer(text, reply_markup=markup)
 
@@ -439,16 +445,22 @@ async def session_delete_ask(callback: CallbackQuery, db: Database) -> None:
 @router.callback_query(F.data.startswith("a:sdy:"))
 async def session_delete(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     session = db.get_session(int(callback.data.split(":")[2]))
-    if session:
-        if session.message_id:
-            try:
-                await bot.delete_message(session.chat_id, session.message_id)
-            except TelegramBadRequest:
-                pass
-        db.delete_session(session.id)
-        await show_month(callback, db, session.date[:7], 0)
+    if session is None:
+        await show_months(callback, db)
         return
-    await show_months(callback, db)
+    # Сначала удаляем из журнала — это главное. Сообщение в группе стираем по
+    # возможности: Telegram может отказать (старое сообщение, бота убрали из чата,
+    # группа стала супергруппой) — удаление занятия от этого не должно зависеть.
+    db.delete_session(session.id)
+    note = "Занятие удалено"
+    if session.message_id:
+        try:
+            await bot.delete_message(session.chat_id, session.message_id)
+        except Exception as e:
+            log.warning("Не удалось удалить сообщение занятия %s: %s", session.id, e)
+            note += ". Сообщение в группе удалите вручную — Telegram не дал это сделать"
+    await callback.answer(note, show_alert=note != "Занятие удалено")
+    await show_month(callback, db, session.date[:7], 0)
 
 
 @router.callback_query(F.data.startswith("a:se:"))

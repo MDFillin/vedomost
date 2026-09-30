@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 
 from aiogram import Bot
 from aiogram.enums import ButtonStyle
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramMigrateToChat, TelegramRetryAfter
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from .db import Database, Session
@@ -223,14 +223,23 @@ async def send_session(
     if session is None:
         return None  # этот слот уже отправлялся
 
-    try:
-        msg = await bot.send_message(
-            chat_id,
+    async def send(to: int):
+        return await bot.send_message(
+            to,
             group_text(db, session),
             reply_markup=group_keyboard(db, session),
             protect_content=db.get_bool("protect_content"),
             message_thread_id=db.group_thread_id,
         )
+
+    try:
+        try:
+            msg = await send(chat_id)
+        except TelegramMigrateToChat as e:
+            # группа стала супергруппой, а мы не успели это заметить
+            db.migrate_chat(chat_id, e.migrate_to_chat_id)
+            session = db.get_session(session.id)
+            msg = await send(e.migrate_to_chat_id)
     except Exception:
         db.delete_session(session.id)
         raise
@@ -261,8 +270,8 @@ async def refresh_group_message(bot: Bot, db: Database, session_id: int) -> None
     except TelegramBadRequest as e:
         if "not modified" not in str(e):
             log.warning("Не удалось обновить сообщение занятия %s: %s", session_id, e)
-    except TelegramForbiddenError as e:
-        log.warning("Нет доступа к группе: %s", e)
+    except Exception as e:  # бот удалён из чата, группа мигрировала и т.п.
+        log.warning("Не удалось обновить сообщение занятия %s: %s", session_id, e)
 
 
 class RefreshDebouncer:

@@ -370,6 +370,15 @@ class Database:
         ).fetchall()
         return [self._session(r) for r in rows]
 
+    def migrate_chat(self, old_id: int, new_id: int) -> None:
+        """Группа стала супергруппой: у неё новый ID, переносим на него всё."""
+        self.conn.execute("UPDATE sessions SET chat_id = ? WHERE chat_id = ?", (new_id, old_id))
+        self.conn.execute(
+            "UPDATE settings SET value = ? WHERE key = 'group_chat_id' AND value = ?",
+            (str(new_id), str(old_id)),
+        )
+        self.conn.commit()
+
     def slot_exists(self, slot: str) -> bool:
         return self.conn.execute("SELECT 1 FROM sessions WHERE slot = ?", (slot,)).fetchone() is not None
 

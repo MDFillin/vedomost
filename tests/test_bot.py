@@ -36,7 +36,7 @@ from aiogram.types import (
 
 from bot.config import Config
 from bot.db import Database
-from bot.handlers import admin, group, sick
+from bot.handlers import admin, errors, group, sick
 from bot import members
 from bot.service import compute_close_at, due_slots, next_slot, send_session
 from bot.utils import get_tz, parse_date, parse_times
@@ -99,6 +99,7 @@ def env():
     routers = [group.router, sick.router, *admin.setup(config)]
     for r in routers:
         dp.include_router(r)
+    dp.errors.register(errors.on_error)
     members._member_cache.clear()
     yield db, bot, dp, session
     for r in routers:  # роутеры модульные — отцепляем для следующего теста
@@ -289,6 +290,7 @@ async def test_click_every_admin_button(env):
     queue = ["a:menu"]
     errors = []
 
+    dp.errors.handlers.clear()  # в этом тесте ошибки не глушим, а собираем
     dp.errors.register(lambda event: errors.append(event.exception))
     while queue:
         data = queue.pop()
@@ -708,3 +710,53 @@ async def test_adding_bot_to_second_chat_does_not_rebind(env):
     assert "только в чате группы" in last_alert(session)
     await text(dp, bot, 305, "привет", -2002, "supergroup")
     assert db.get_student(305) is None
+
+
+# ---------- удаление занятия при ошибках Telegram ----------
+
+@pytest.mark.parametrize("exc", ["migrate", "forbidden"])
+async def test_delete_session_when_telegram_refuses(env, exc):
+    from aiogram.exceptions import TelegramForbiddenError, TelegramMigrateToChat
+    from aiogram.methods import DeleteMessage
+
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    s = await send_session(bot, db, date.today(), "10:00")
+    orig = session.make_request
+
+    async def failing(b, m, timeout=None):
+        if isinstance(m, DeleteMessage):
+            if exc == "migrate":
+                raise TelegramMigrateToChat(method=m, message="migrated", migrate_to_chat_id=-100777)
+            raise TelegramForbiddenError(method=m, message="Forbidden: bot was kicked")
+        return await orig(b, m, timeout)
+
+    session.make_request = failing
+    await press(dp, bot, ADMIN, f"a:sdy:{s.id}", ADMIN)
+    assert db.get_session(s.id) is None          # занятие удалено
+    alerts = [a.text or "" for a in session.of(AnswerCallbackQuery)]
+    assert any("удалите вручную" in a for a in alerts)  # и кнопка не зависла
+
+
+async def test_any_crash_still_answers_button(env, monkeypatch):
+    db, bot, dp, session = env
+
+    async def boom(*a, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(admin, "show_months", boom)
+    await press(dp, bot, ADMIN, "a:sl:0", ADMIN)
+    assert "Что-то пошло не так" in last_alert(session)
+
+
+async def test_group_migration_moves_sessions(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    s = await send_session(bot, db, date.today(), "10:00")
+    msg = Message(message_id=next(_uid), date=datetime.now(), chat=Chat(id=GROUP, type="group"),
+                  from_user=user(ADMIN), migrate_to_chat_id=-100555)
+    await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
+    assert db.group_chat_id == -100555
+    assert db.get_session(s.id).chat_id == -100555
+    await press(dp, bot, 201, f"mark:{s.id}", -100555, "Иван Иванов")
+    assert "записано" in last_alert(session)
