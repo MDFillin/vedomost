@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS students (
     full_name    TEXT NOT NULL,
     username     TEXT,
     custom_name  TEXT,
-    active       INTEGER NOT NULL DEFAULT 1,
+    active       INTEGER NOT NULL DEFAULT 1,   -- 0 = староста исключил вручную
+    in_chat      INTEGER NOT NULL DEFAULT 1,   -- 0 = вышел из чата группы
     created_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -55,18 +56,27 @@ CREATE TABLE IF NOT EXISTS skip_dates (
 );
 """
 
+DEFAULT_MESSAGE_TEXT = "📅 {день}, {дата} {время}\n\nЕсли вы на занятии — нажмите кнопку ниже 👇"
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "group_chat_id": "",
     "timezone": "",
-    "title": "Отметка посещаемости",
+    "title": "Отметка посещаемости",  # HTML
+    "message_text": DEFAULT_MESSAGE_TEXT,  # HTML, с подстановками {дата} {день} {время} {до}
     "button_text": "✅ Я был",
+    "mode": "pair",          # pair — отметка на каждой паре, day — одна отметка в день
+    "close_mode": "minutes", # minutes | until | eod (до конца дня) | none
+    "close_until": "18:00",  # для close_mode = until
     "show_count": "1",       # показывать счётчик отметившихся в группе
     "show_names": "0",       # показывать список отметившихся в группе
-    "window_minutes": "90",  # сколько минут открыта отметка (0 = без ограничения)
+    "window_minutes": "90",  # для close_mode = minutes
     "name_format": "full",   # full | username | both
     "stats_sort": "name",    # name | time
     "pin_message": "0",      # закреплять сообщение в группе
     "notify_on_close": "1",  # присылать старосте итог после закрытия отметки
+    "members_only": "1",     # отмечаться могут только участники чата группы
+    "roster_only": "0",      # отмечаться могут только студенты из списка
+    "protect_content": "1",  # запрет пересылки и копирования сообщения
 }
 
 
@@ -81,11 +91,17 @@ class Student:
     username: str | None
     custom_name: str | None
     active: bool
+    in_chat: bool
     created_at: str
 
     @property
     def name(self) -> str:
         return self.custom_name or self.full_name
+
+    @property
+    def counted(self) -> bool:
+        """Учитывается в статистике: не исключён старостой и состоит в чате."""
+        return self.active and self.in_chat
 
 
 @dataclass
@@ -116,6 +132,7 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         for key, value in DEFAULT_SETTINGS.items():
             if key == "timezone":
                 value = default_tz
@@ -123,6 +140,23 @@ class Database:
                 "INSERT OR IGNORE INTO settings(key, value) VALUES (?, ?)", (key, value)
             )
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(students)")}
+        if "in_chat" not in cols:
+            self.conn.execute(
+                "ALTER TABLE students ADD COLUMN in_chat INTEGER NOT NULL DEFAULT 1"
+            )
+        # в первой версии «0 минут» означало «без ограничения»
+        row = self.conn.execute(
+            "SELECT value FROM settings WHERE key = 'window_minutes'"
+        ).fetchone()
+        has_mode = self.conn.execute(
+            "SELECT 1 FROM settings WHERE key = 'close_mode'"
+        ).fetchone()
+        if row and row["value"] == "0" and not has_mode:
+            self.conn.execute("INSERT INTO settings(key, value) VALUES ('close_mode', 'none')")
+            self.conn.execute("UPDATE settings SET value = '90' WHERE key = 'window_minutes'")
 
     # ---------- настройки ----------
     def get(self, key: str) -> str:
@@ -167,24 +201,44 @@ class Database:
             username=row["username"],
             custom_name=row["custom_name"],
             active=bool(row["active"]),
+            in_chat=bool(row["in_chat"]),
             created_at=row["created_at"],
         )
 
-    def upsert_student(self, user_id: int, full_name: str, username: str | None) -> bool:
+    def upsert_student(
+        self, user_id: int, full_name: str, username: str | None, in_chat: bool = True
+    ) -> bool:
         """Добавляет студента или обновляет имя из Telegram. Возвращает True, если он новый."""
         cur = self.conn.execute(
-            "INSERT OR IGNORE INTO students(user_id, full_name, username, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (user_id, full_name, username, utcnow().isoformat()),
+            "INSERT OR IGNORE INTO students(user_id, full_name, username, in_chat, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, full_name or str(user_id), username, int(in_chat), utcnow().isoformat()),
         )
         is_new = cur.rowcount == 1
         if not is_new:
             self.conn.execute(
-                "UPDATE students SET full_name = ?, username = ? WHERE user_id = ?",
-                (full_name, username, user_id),
+                "UPDATE students SET full_name = ?, username = ?, in_chat = ? WHERE user_id = ?",
+                (full_name or str(user_id), username, int(in_chat), user_id),
             )
         self.conn.commit()
         return is_new
+
+    def set_in_chat(self, user_id: int, in_chat: bool) -> None:
+        self.conn.execute(
+            "UPDATE students SET in_chat = ? WHERE user_id = ?", (int(in_chat), user_id)
+        )
+        self.conn.commit()
+
+    def sync_members(self, members: list[tuple[int, str, str | None]]) -> tuple[int, int]:
+        """Полная сверка со списком участников чата. Возвращает (новых, вышедших)."""
+        member_ids = {uid for uid, _, _ in members}
+        added = sum(self.upsert_student(uid, name, username) for uid, name, username in members)
+        left = 0
+        for st in self.list_students(include_inactive=True):
+            if st.in_chat and st.user_id not in member_ids:
+                self.set_in_chat(st.user_id, False)
+                left += 1
+        return added, left
 
     def get_student(self, user_id: int) -> Student | None:
         row = self.conn.execute("SELECT * FROM students WHERE user_id = ?", (user_id,)).fetchone()
@@ -193,7 +247,7 @@ class Database:
     def list_students(self, include_inactive: bool = False) -> list[Student]:
         sql = "SELECT * FROM students"
         if not include_inactive:
-            sql += " WHERE active = 1"
+            sql += " WHERE active = 1 AND in_chat = 1"
         rows = self.conn.execute(sql).fetchall()
         students = [self._student(r) for r in rows]
         students.sort(key=lambda s: s.name.lower())
@@ -255,6 +309,9 @@ class Database:
             return None
         self.conn.commit()
         return self.get_session(cur.lastrowid)
+
+    def slot_exists(self, slot: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM sessions WHERE slot = ?", (slot,)).fetchone() is not None
 
     def set_session_message(self, session_id: int, message_id: int) -> None:
         self.conn.execute(

@@ -2,9 +2,9 @@
 
 import csv
 import io
-from datetime import timedelta
 
 from aiogram import Bot, F, Router
+from aiogram.enums import ButtonStyle
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -18,9 +18,17 @@ from aiogram.types import (
 )
 
 from ..config import Config
-from ..db import Database, Session
+from ..db import DEFAULT_SETTINGS, Database, Session
+from ..members import sync_members, sync_report
 from ..service import (
+    PLACEHOLDERS,
+    apply_close_settings,
     close_session,
+    compute_close_at,
+    day_mode,
+    describe_close,
+    find_day_session,
+    preview_text,
     is_open,
     next_slot,
     refresh_group_message,
@@ -52,7 +60,7 @@ router.callback_query.filter(F.message.chat.type == "private")
 SESSIONS_PER_PAGE = 8
 STUDENTS_PER_PAGE = 12
 MARKS_PER_PAGE = 20
-WINDOW_OPTIONS = [15, 30, 45, 60, 90, 120, 180, 240, 360, 720, 1440, 0]
+WINDOW_OPTIONS = [15, 30, 45, 60, 90, 120, 180, 240]
 
 
 class Input(StatesGroup):
@@ -60,6 +68,8 @@ class Input(StatesGroup):
     extra_date = State()
     skip_date = State()
     title = State()
+    message_text = State()
+    close_until = State()
     button = State()
     timezone = State()
     rename = State()
@@ -153,13 +163,13 @@ async def cmd_start(message: Message, db: Database, state: FSMContext) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(
         "<b>Как пользоваться</b>\n\n"
-        "1. Добавьте бота в общий чат группы.\n"
-        "2. Отправьте в этом чате команду /bind — бот запомнит чат.\n"
+        "1. Сами добавьте бота в общий чат группы — он привяжется и считает участников.\n"
+        "2. Если бот уже был в чате — отправьте там /bind.\n"
         "3. Здесь, в личке, откройте /menu → 🗓 Расписание и добавьте дни и время.\n"
         "4. В назначенное время бот пришлёт в группу сообщение с кнопкой «✅ Я был».\n"
         "5. Статистика — в разделе 📊 Занятия, сводка по людям — в 👥 Студенты.\n\n"
-        "Студенты попадают в список, когда первый раз нажимают кнопку. Чтобы сразу "
-        "собрать весь список, используйте «📨 Регистрация в группе» в разделе 👥 Студенты.\n\n"
+        "Режим (каждая пара / раз в день), время работы кнопки, текст сообщения и защита "
+        "от накрутки — в ⚙️ Настройки.\n\n"
         "Команды: /menu — панель, /cancel — отменить ввод, /bind и /unbind — в групповом чате."
     )
 
@@ -413,13 +423,16 @@ async def students_list(callback: CallbackQuery, db: Database) -> None:
 async def show_students_list(callback: CallbackQuery, db: Database, page: int) -> None:
     fmt = db.get("name_format")
     students = db.list_students(include_inactive=True)
-    active = [s for s in students if s.active]
+    students.sort(key=lambda s: (not s.counted, s.name.lower()))
+    active = [s for s in students if s.counted]
+    left = len([s for s in students if s.active and not s.in_chat])
     total_sessions = db.count_sessions()
     counts = db.attendance_counts()
 
     lines = [
         "👥 <b>Студенты и сводка посещаемости</b>",
-        f"Всего занятий: {total_sessions}",
+        f"Всего занятий: {total_sessions} · в списке: {len(active)}"
+        + (f" · вышли из чата: {left}" if left else ""),
         "",
     ]
     ranked = sorted(active, key=lambda s: (-counts.get(s.user_id, 0), s.name.lower()))
@@ -430,8 +443,8 @@ async def show_students_list(callback: CallbackQuery, db: Database, page: int) -
         )
     if not active:
         lines.append(
-            "Список пуст. Студенты появятся здесь после первого нажатия кнопки "
-            "или после регистрации (кнопка ниже)."
+            "Список пуст. Нажмите «🔄 Считать участников чата» — или студенты появятся "
+            "после первого нажатия кнопки / регистрации."
         )
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -441,16 +454,27 @@ async def show_students_list(callback: CallbackQuery, db: Database, page: int) -
     rows: list[Row] = []
     pair: Row = []
     for st in chunk:
-        prefix = "" if st.active else "🚫 "
+        prefix = "" if st.counted else ("🚫 " if not st.active else "🚪 ")
         pair.append((prefix + student_name(st, fmt), f"a:u:{st.user_id}"))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     rows.append(pair)
     rows.append(pager("a:stl", page, len(students), STUDENTS_PER_PAGE))
+    rows.append([("🔄 Считать участников чата", "a:sync")])
     rows.append([("📨 Регистрация в группе", "a:reg")])
     rows.append(BACK_TO_MENU)
     await show(callback, text, kb(*rows))
+
+
+@router.callback_query(F.data == "a:sync")
+async def members_sync(callback: CallbackQuery, bot: Bot, db: Database, config: Config) -> None:
+    if db.group_chat_id is None:
+        await callback.answer("Сначала привяжите группу командой /bind в чате", show_alert=True)
+        return
+    result = await sync_members(bot, db, config)
+    await callback.message.answer(sync_report(result, db, config))
+    await show_students_list(callback, db, 0)
 
 
 async def show_student(target: Message | CallbackQuery, db: Database, uid: int) -> None:
@@ -468,7 +492,11 @@ async def show_student(target: Message | CallbackQuery, db: Database, uid: int) 
         f"Имя в Telegram: {esc(st.full_name)}",
         f"Username: @{esc(st.username)}" if st.username else "Username: —",
         f"ID: <code>{st.user_id}</code>",
-        "Статус: " + ("в списке" if st.active else "🚫 исключён из статистики"),
+        "Статус: " + (
+            "🚫 исключён старостой" if not st.active
+            else "🚪 вышел из чата" if not st.in_chat
+            else "в списке"
+        ),
         "",
         f"✅ Посетил: {n}/{len(sessions)} ({pct(n, len(sessions))})",
         f"❌ Пропустил: {len(missed)}",
@@ -591,10 +619,18 @@ async def send_ask(callback: CallbackQuery, db: Database) -> None:
         )
         return
     now = now_local(db)
-    window = db.get_int("window_minutes")
+    if day_mode(db):
+        existing = find_day_session(db, now.date())
+        if existing:
+            await callback.answer(
+                "Режим «раз в день»: отметка за сегодня уже есть.", show_alert=True
+            )
+            await show_session(callback, db, existing.id)
+            return
+    close_at = compute_close_at(db, now)
     until = (
-        f"Отметка будет открыта до {(now + timedelta(minutes=window)):%H:%M}."
-        if window else "Отметка будет открыта, пока вы её не закроете."
+        f"Кнопка будет активна до {close_at:%H:%M}."
+        if close_at else "Кнопка будет активна, пока вы не закроете отметку."
     )
     await show(
         callback,
@@ -612,9 +648,11 @@ async def send_now(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     except Exception as e:
         await callback.answer(f"Не удалось отправить: {e}", show_alert=True)
         return
+    if session is None:
+        await callback.answer("Отметка за сегодня уже отправлена.", show_alert=True)
+        return
     await callback.answer("Отправлено в группу ✅")
-    if session:
-        await show_session(callback, db, session.id)
+    await show_session(callback, db, session.id)
 
 
 # ---------- расписание ----------
@@ -854,32 +892,45 @@ async def schedule_delete_item(callback: CallbackQuery, db: Database) -> None:
 
 # ---------- настройки ----------
 
+MODE_NAMES = {"pair": "на каждой паре", "day": "раз в день"}
+
+
+def protection_summary(db: Database) -> str:
+    parts = []
+    if db.get_bool("members_only"):
+        parts.append("только участники чата")
+    if db.get_bool("roster_only"):
+        parts.append("только из списка")
+    if db.get_bool("protect_content"):
+        parts.append("запрет пересылки")
+    return ", ".join(parts) or "выключена"
+
+
 async def show_settings(target: Message | CallbackQuery, db: Database) -> None:
-    window = db.get_int("window_minutes")
-    window_text = f"{window} мин" if window else "без ограничения"
     sort_text = "по алфавиту" if db.get("stats_sort") == "name" else "по времени отметки"
     name_text = NAME_FORMATS.get(db.get("name_format"), "Имя Фамилия")
+    mode_text = MODE_NAMES.get(db.get("mode"), "на каждой паре")
+    close_text = describe_close(db)
 
     text = (
         "⚙️ <b>Настройки</b>\n\n"
-        "<b>Сообщение в группе</b>\n"
-        f"Заголовок: {esc(db.get('title'))}\n"
-        f"Кнопка: {esc(db.get('button_text'))}\n"
-        f"Время на отметку: {window_text}\n\n"
-        "<b>Отображение</b>\n"
-        f"Формат имён: {name_text}\n"
-        f"Сортировка «кто был»: {sort_text}\n"
-        f"Часовой пояс: {esc(db.get('timezone'))}"
+        f"🔁 Режим отметки: <b>{mode_text}</b>\n"
+        f"⏳ Кнопка активна: <b>{close_text}</b>\n"
+        f"🛡 Защита: {protection_summary(db)}\n\n"
+        f"🏷 Формат имён: {name_text}\n"
+        f"↕️ Сортировка «кто был»: {sort_text}\n"
+        f"🌍 Часовой пояс: {esc(db.get('timezone'))}"
     )
     markup = kb(
-        [(f"{on_off(db.get_bool('show_count'))} Счётчик в группе", "a:sett:show_count")],
-        [(f"{on_off(db.get_bool('show_names'))} Список имён в группе", "a:sett:show_names")],
-        [(f"{on_off(db.get_bool('pin_message'))} Закреплять сообщение", "a:sett:pin_message")],
-        [(f"{on_off(db.get_bool('notify_on_close'))} Итог мне после закрытия",
-          "a:sett:notify_on_close")],
-        [(f"⏳ Время на отметку: {window_text}", "a:setw")],
+        [("📝 Текст сообщения и кнопки", "a:setm")],
+        [(f"🔁 Режим: {mode_text}", "a:setmode")],
+        [(f"⏳ Кнопка активна: {close_text}", "a:setw")],
+        [("🛡 Защита от накрутки", "a:setp")],
+        [(f"{on_off(db.get_bool('show_count'))} Счётчик в группе", "a:sett:show_count"),
+         (f"{on_off(db.get_bool('show_names'))} Имена в группе", "a:sett:show_names")],
+        [(f"{on_off(db.get_bool('pin_message'))} Закреплять", "a:sett:pin_message"),
+         (f"{on_off(db.get_bool('notify_on_close'))} Итог мне", "a:sett:notify_on_close")],
         [(f"🏷 Имена: {name_text}", "a:setn"), (f"↕️ {sort_text}", "a:sets")],
-        [("✏️ Заголовок", "a:seti:title"), ("🔘 Текст кнопки", "a:seti:button")],
         [("🌍 Часовой пояс", "a:seti:timezone")],
         BACK_TO_MENU,
     )
@@ -892,14 +943,23 @@ async def settings_view(callback: CallbackQuery, db: Database, state: FSMContext
     await show_settings(callback, db)
 
 
+TOGGLES = {
+    "show_count", "show_names", "pin_message", "notify_on_close",
+    "members_only", "roster_only", "protect_content",
+}
+
+
 @router.callback_query(F.data.startswith("a:sett:"))
 async def settings_toggle(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     key = callback.data.split(":")[2]
-    if key in {"show_count", "show_names", "pin_message", "notify_on_close"}:
+    if key in TOGGLES:
         db.toggle(key)
     if key in {"show_count", "show_names"}:
         await refresh_open_sessions(bot, db)
-    await show_settings(callback, db)
+    if key in {"members_only", "roster_only", "protect_content"}:
+        await show_protection(callback, db)
+    else:
+        await show_settings(callback, db)
 
 
 async def refresh_open_sessions(bot: Bot, db: Database) -> None:
@@ -908,29 +968,213 @@ async def refresh_open_sessions(bot: Bot, db: Database) -> None:
             await refresh_group_message(bot, db, s.id)
 
 
-@router.callback_query(F.data == "a:setw")
-async def settings_window(callback: CallbackQuery, db: Database) -> None:
-    current = db.get_int("window_minutes")
-    buttons = []
-    for m in WINDOW_OPTIONS:
-        label = "∞ без ограничения" if m == 0 else (f"{m // 60} ч" if m % 60 == 0 else f"{m} мин")
-        if m == current:
-            label = "• " + label
-        buttons.append((label, f"a:setwv:{m}"))
-    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+# --- текст сообщения ---
+
+async def show_message_settings(target: Message | CallbackQuery, db: Database) -> None:
+    placeholders = "\n".join(f"<code>{k}</code> — {v}" for k, v in PLACEHOLDERS.items())
+    text = (
+        "📝 <b>Сообщение в группе</b>\n"
+        "Так оно будет выглядеть:\n"
+        "┈┈┈┈┈┈┈┈┈┈┈┈\n"
+        f"{preview_text(db)}\n"
+        f"[ {esc(db.get('button_text'))} ]\n"
+        "┈┈┈┈┈┈┈┈┈┈┈┈\n\n"
+        "В тексте можно использовать подстановки:\n"
+        f"{placeholders}\n\n"
+        "Жирный, курсив и другое форматирование Telegram сохраняются."
+    )
     await show(
-        callback,
-        "⏳ Сколько времени после отправки можно нажимать кнопку «Я был»?\n"
-        "После этого отметка закроется, кнопка исчезнет.",
-        kb(*rows, [("« Назад", "a:set")]),
+        target,
+        text,
+        kb(
+            [("✏️ Заголовок", "a:seti:title"), ("✏️ Текст", "a:seti:message_text")],
+            [("🔘 Текст кнопки", "a:seti:button")],
+            [("👁 Прислать предпросмотр", "a:setpv")],
+            [("↩️ Вернуть стандартный текст", "a:setmr")],
+            [("« Назад", "a:set")],
+        ),
     )
 
 
-@router.callback_query(F.data.startswith("a:setwv:"))
-async def settings_window_set(callback: CallbackQuery, db: Database) -> None:
-    db.set("window_minutes", int(callback.data.split(":")[2]))
+@router.callback_query(F.data == "a:setm")
+async def settings_message(callback: CallbackQuery, db: Database, state: FSMContext) -> None:
+    await state.clear()
+    await show_message_settings(callback, db)
+
+
+@router.callback_query(F.data == "a:setpv")
+async def settings_preview(callback: CallbackQuery, db: Database) -> None:
+    await callback.message.answer(
+        preview_text(db),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=db.get("button_text"), callback_data="a:noop", style=ButtonStyle.SUCCESS,
+        )]]),
+    )
+    await callback.answer("Предпросмотр ниже 👇")
+
+
+@router.callback_query(F.data == "a:setmr")
+async def settings_message_reset(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    for key in ("title", "message_text", "button_text"):
+        db.set(key, DEFAULT_SETTINGS[key])
+    await refresh_open_sessions(bot, db)
+    await show_message_settings(callback, db)
+
+
+# --- режим ---
+
+@router.callback_query(F.data == "a:setmode")
+async def settings_mode(callback: CallbackQuery, db: Database) -> None:
+    current = db.get("mode")
+
+    def label(key: str, text: str) -> tuple[str, str]:
+        return (("• " if key == current else "") + text, f"a:setmode:{key}")
+
+    await show(
+        callback,
+        "🔁 <b>Режим отметки</b>\n\n"
+        "<b>На каждой паре</b> — сообщение приходит в каждое время из расписания. "
+        "Например, при 09:00 и 13:40 будет две отметки в день, статистика — по парам.\n\n"
+        "<b>Раз в день</b> — одно сообщение в день (в первое время из расписания), "
+        "статистика — по дням. Подходит, если нужно просто отметить, кто пришёл на учёбу.",
+        kb(
+            [label("pair", "📚 На каждой паре")],
+            [label("day", "📅 Раз в день")],
+            [("« Назад", "a:set")],
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith("a:setmode:"))
+async def settings_mode_set(callback: CallbackQuery, db: Database) -> None:
+    mode = callback.data.split(":")[2]
+    if mode in MODE_NAMES:
+        db.set("mode", mode)
     await show_settings(callback, db)
 
+
+# --- время активности кнопки ---
+
+@router.callback_query(F.data == "a:setw")
+async def settings_window(callback: CallbackQuery, db: Database) -> None:
+    mode = db.get("close_mode")
+    current = db.get_int("window_minutes")
+    buttons = []
+    for m in WINDOW_OPTIONS:
+        label = f"{m // 60} ч" if m % 60 == 0 else f"{m} мин"
+        if mode == "minutes" and m == current:
+            label = "• " + label
+        buttons.append((label, f"a:setwv:{m}"))
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+
+    def mark(key: str, text: str) -> str:
+        return ("• " if mode == key else "") + text
+
+    until = db.get("close_until")
+    await show(
+        callback,
+        "⏳ <b>До какого момента можно нажимать «Я был»?</b>\n\n"
+        f"Сейчас: <b>{describe_close(db)}</b>\n\n"
+        "• <b>N минут / часов</b> — считается от момента отправки сообщения.\n"
+        "• <b>До определённого времени</b> — например, до 10:30 в тот же день.\n"
+        "• <b>До конца дня</b> — до 23:59.\n\n"
+        "После этого кнопка исчезнет у всех. Изменение сразу применяется и к открытой "
+        "сейчас отметке.",
+        kb(
+            *rows,
+            [(mark("until", f"🕐 До определённого времени ({until})"), "a:setwu")],
+            [(mark("eod", "🌙 До конца дня"), "a:setwm:eod"),
+             (mark("none", "∞ Пока не закрою"), "a:setwm:none")],
+            [("« Назад", "a:set")],
+        ),
+    )
+
+
+async def after_close_change(target: Message | CallbackQuery, bot: Bot, db: Database) -> None:
+    changed = await apply_close_settings(bot, db)
+    if changed and isinstance(target, Message):
+        await target.answer(f"Обновил время закрытия у открытых отметок: {changed}")
+    await show_settings(target, db)
+
+
+@router.callback_query(F.data.startswith("a:setwv:"))
+async def settings_window_set(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    db.set("window_minutes", int(callback.data.split(":")[2]))
+    db.set("close_mode", "minutes")
+    await after_close_change(callback, bot, db)
+
+
+@router.callback_query(F.data.startswith("a:setwm:"))
+async def settings_window_mode(callback: CallbackQuery, bot: Bot, db: Database) -> None:
+    mode = callback.data.split(":")[2]
+    if mode in {"eod", "none"}:
+        db.set("close_mode", mode)
+    await after_close_change(callback, bot, db)
+
+
+@router.callback_query(F.data == "a:setwu")
+async def settings_until_ask(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Input.close_until)
+    await show(
+        callback,
+        "🕐 До какого времени можно отмечаться? Отправьте время, например <code>10:30</code>.\n\n"
+        "Если отметка отправлена позже этого времени, кнопка будет активна до конца дня.",
+        kb([("✖️ Отмена", "a:setw")]),
+    )
+
+
+@router.message(Input.close_until, F.text)
+async def settings_until(message: Message, bot: Bot, db: Database, state: FSMContext) -> None:
+    t = parse_time(message.text)
+    if t is None:
+        await message.answer(
+            "Не понял время 🤔 Пример: <code>10:30</code>", reply_markup=kb([("✖️ Отмена", "a:setw")])
+        )
+        return
+    db.set("close_until", t)
+    db.set("close_mode", "until")
+    await state.clear()
+    await after_close_change(message, bot, db)
+
+
+# --- защита ---
+
+async def show_protection(target: Message | CallbackQuery, db: Database) -> None:
+    text = (
+        "🛡 <b>Защита от накрутки</b>\n\n"
+        "<b>Работает всегда:</b>\n"
+        "• отметиться можно только один раз;\n"
+        "• кнопка работает только в самом чате группы — нажатия с пересланных копий "
+        "не засчитываются;\n"
+        "• исключённые старостой и боты отметиться не могут.\n\n"
+        "<b>Настраивается:</b>\n"
+        "• <b>Только участники чата</b> — бот спрашивает у Telegram, состоит ли нажавший "
+        "в группе. Посторонний, получивший кнопку, отметиться не сможет.\n"
+        "• <b>Запрет пересылки</b> — сообщение с кнопкой нельзя переслать, скопировать "
+        "или сохранить.\n"
+        "• <b>Только из списка</b> — отмечаться могут лишь студенты из списка группы; "
+        "новички не добавятся сами. Включайте, когда список уже полный."
+    )
+    await show(
+        target,
+        text,
+        kb(
+            [(f"{on_off(db.get_bool('members_only'))} Только участники чата",
+              "a:sett:members_only")],
+            [(f"{on_off(db.get_bool('protect_content'))} Запрет пересылки",
+              "a:sett:protect_content")],
+            [(f"{on_off(db.get_bool('roster_only'))} Только из списка", "a:sett:roster_only")],
+            [("« Назад", "a:set")],
+        ),
+    )
+
+
+@router.callback_query(F.data == "a:setp")
+async def settings_protection(callback: CallbackQuery, db: Database) -> None:
+    await show_protection(callback, db)
+
+
+# --- прочее ---
 
 @router.callback_query(F.data == "a:setn")
 async def settings_name_format(callback: CallbackQuery, bot: Bot, db: Database) -> None:
@@ -950,31 +1194,49 @@ async def settings_sort(callback: CallbackQuery, db: Database) -> None:
 
 
 INPUT_PROMPTS = {
-    "title": (Input.title, "Отправьте новый заголовок сообщения в группе.\n"
-                           "Например: <code>Посещаемость ИВТ-21</code>"),
-    "button": (Input.button, "Отправьте новый текст кнопки (до 40 символов).\n"
-                             "Например: <code>✅ Я на паре</code>"),
-    "timezone": (Input.timezone, "Отправьте часовой пояс в формате IANA, например:\n"
-                                 "<code>Europe/Moscow</code>, <code>Asia/Yekaterinburg</code>, "
-                                 "<code>Asia/Novosibirsk</code>, <code>Europe/Kaliningrad</code>, "
-                                 "<code>Asia/Vladivostok</code>, <code>Europe/Minsk</code>, "
-                                 "<code>Asia/Almaty</code>"),
+    "title": (Input.title, "a:setm",
+              "Отправьте новый заголовок сообщения (можно с форматированием).\n"
+              "Например: <code>Посещаемость ИВТ-21</code>\n\n"
+              "Чтобы убрать заголовок, отправьте <code>-</code>"),
+    "message_text": (Input.message_text, "a:setm",
+                     "Отправьте новый текст сообщения. Можно в несколько строк и с "
+                     "форматированием. Подстановки: <code>{дата}</code>, <code>{день}</code>, "
+                     "<code>{время}</code>, <code>{до}</code>.\n\nНапример:\n"
+                     "<code>📅 {день}, {дата}\nОтметьтесь до {до}, если вы на паре 👇</code>"),
+    "button": (Input.button, "a:setm",
+               "Отправьте новый текст кнопки (до 40 символов).\n"
+               "Например: <code>✅ Я на паре</code>"),
+    "timezone": (Input.timezone, "a:set",
+                 "Отправьте часовой пояс в формате IANA, например:\n"
+                 "<code>Europe/Moscow</code>, <code>Asia/Yekaterinburg</code>, "
+                 "<code>Asia/Novosibirsk</code>, <code>Europe/Kaliningrad</code>, "
+                 "<code>Asia/Vladivostok</code>, <code>Europe/Minsk</code>, "
+                 "<code>Asia/Almaty</code>"),
 }
 
 
 @router.callback_query(F.data.startswith("a:seti:"))
 async def settings_input_ask(callback: CallbackQuery, state: FSMContext) -> None:
-    st, prompt = INPUT_PROMPTS[callback.data.split(":")[2]]
+    st, back, prompt = INPUT_PROMPTS[callback.data.split(":")[2]]
     await state.set_state(st)
-    await show(callback, prompt, kb([("✖️ Отмена", "a:set")]))
+    await show(callback, prompt, kb([("✖️ Отмена", back)]))
 
 
 @router.message(Input.title, F.text)
 async def settings_title(message: Message, bot: Bot, db: Database, state: FSMContext) -> None:
-    db.set("title", message.text.strip()[:100])
+    title = "" if message.text.strip() == "-" else message.html_text.strip()[:300]
+    db.set("title", title)
     await state.clear()
     await refresh_open_sessions(bot, db)
-    await show_settings(message, db)
+    await show_message_settings(message, db)
+
+
+@router.message(Input.message_text, F.text)
+async def settings_message_text(message: Message, bot: Bot, db: Database, state: FSMContext) -> None:
+    db.set("message_text", message.html_text.strip()[:3000])
+    await state.clear()
+    await refresh_open_sessions(bot, db)
+    await show_message_settings(message, db)
 
 
 @router.message(Input.button, F.text)
@@ -982,7 +1244,7 @@ async def settings_button(message: Message, bot: Bot, db: Database, state: FSMCo
     db.set("button_text", message.text.strip()[:40])
     await state.clear()
     await refresh_open_sessions(bot, db)
-    await show_settings(message, db)
+    await show_message_settings(message, db)
 
 
 @router.message(Input.timezone, F.text)

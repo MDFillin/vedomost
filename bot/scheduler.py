@@ -5,8 +5,10 @@ import logging
 
 from aiogram import Bot
 
+from .config import Config
 from .db import Database
-from .service import close_session, due_slots, notify_admins, send_session, slot_key
+from .members import sync_members
+from .service import close_session, due_slots, notify_admins, send_session, slot_key, slot_sent
 from .utils import esc, now_local
 
 log = logging.getLogger(__name__)
@@ -14,12 +16,13 @@ log = logging.getLogger(__name__)
 TICK_SECONDS = 20
 
 
-async def tick(bot: Bot, db: Database, admin_ids: frozenset[int], failed: set[str]) -> None:
+async def tick(bot: Bot, db: Database, config: Config, failed: set[str]) -> None:
+    admin_ids = config.admin_ids
     now = now_local(db)
 
     for day, t in due_slots(db, now):
         key = slot_key(day, t)
-        if key in failed:
+        if key in failed or slot_sent(db, day, t):
             continue
         if db.group_chat_id is None:
             failed.add(key)
@@ -29,6 +32,11 @@ async def tick(bot: Bot, db: Database, admin_ids: frozenset[int], failed: set[st
                 "Добавьте бота в чат группы и отправьте там /bind",
             )
             continue
+        if config.can_read_members:
+            try:  # перед отметкой сверяем состав чата: кто пришёл, кто ушёл
+                await sync_members(bot, db, config)
+            except Exception:
+                log.exception("Не удалось обновить состав чата")
         try:
             session = await send_session(bot, db, day, t, slot=key)
             if session:
@@ -47,11 +55,11 @@ async def tick(bot: Bot, db: Database, admin_ids: frozenset[int], failed: set[st
             log.exception("Ошибка при закрытии занятия %s", session.id)
 
 
-async def run_scheduler(bot: Bot, db: Database, admin_ids: frozenset[int]) -> None:
+async def run_scheduler(bot: Bot, db: Database, config: Config) -> None:
     failed: set[str] = set()
     while True:
         try:
-            await tick(bot, db, admin_ids, failed)
+            await tick(bot, db, config, failed)
         except Exception:
             log.exception("Ошибка планировщика")
         await asyncio.sleep(TICK_SECONDS)

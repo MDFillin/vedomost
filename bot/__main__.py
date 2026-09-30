@@ -43,7 +43,7 @@ async def main() -> None:
         except Exception:
             logging.warning("Староста %s ещё не писал боту — напишите ему /start", admin_id)
 
-    scheduler = asyncio.create_task(run_scheduler(bot, db, config.admin_ids))
+    scheduler = asyncio.create_task(run_scheduler(bot, db, config))
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:

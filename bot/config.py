@@ -11,6 +11,13 @@ class Config:
     admin_ids: frozenset[int]
     db_path: str
     default_tz: str
+    # Необязательно: ключи с my.telegram.org, чтобы бот сам считывал всех участников чата
+    api_id: int | None = None
+    api_hash: str | None = None
+
+    @property
+    def can_read_members(self) -> bool:
+        return bool(self.api_id and self.api_hash)
 
 
 def load_config() -> Config:
@@ -27,9 +34,14 @@ def load_config() -> Config:
     tz = os.getenv("TIMEZONE", "Europe/Moscow").strip()
     ZoneInfo(tz)  # проверка, что пояс существует
 
+    api_id = os.getenv("API_ID", "").strip()
+    api_hash = os.getenv("API_HASH", "").strip()
+
     return Config(
         token=token,
         admin_ids=admin_ids,
         db_path=os.getenv("DB_PATH", "data/vedomost.db"),
         default_tz=tz,
+        api_id=int(api_id) if api_id else None,
+        api_hash=api_hash or None,
     )

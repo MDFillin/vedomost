@@ -12,20 +12,35 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import (
     AnswerCallbackQuery,
     EditMessageText,
+    GetChatAdministrators,
+    GetChatMember,
+    GetChatMemberCount,
     SendDocument,
     SendMessage,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, Message, Update, User
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    ChatMemberLeft,
+    ChatMemberMember,
+    ChatMemberOwner,
+    ChatMemberUpdated,
+    Message,
+    Update,
+    User,
+)
 
 from bot.config import Config
 from bot.db import Database
 from bot.handlers import admin, group
-from bot.service import due_slots, next_slot, send_session
+from bot import members
+from bot.service import compute_close_at, due_slots, next_slot, send_session
 from bot.utils import get_tz, parse_date, parse_times
 
 ADMIN = 100
 GROUP = -1001
+OUTSIDER = 999  # не состоит в чате группы
 STUDENTS = [(201, "Иван Иванов"), (202, "Пётр Петров"), (203, "Анна Смирнова")]
 
 
@@ -47,6 +62,15 @@ class FakeSession(BaseSession):
             )
         if isinstance(method, EditMessageText):
             return True
+        if isinstance(method, GetChatMember):
+            u = User(id=method.user_id, is_bot=False, first_name="X")
+            if method.user_id == OUTSIDER:
+                return ChatMemberLeft(user=u)
+            return ChatMemberMember(user=u)
+        if isinstance(method, GetChatAdministrators):
+            return [ChatMemberOwner(user=user(ADMIN), is_anonymous=False)]
+        if isinstance(method, GetChatMemberCount):
+            return 31
         return True
 
     async def close(self) -> None:
@@ -70,6 +94,7 @@ def env():
     routers = [group.router, *admin.setup(config)]
     for r in routers:
         dp.include_router(r)
+    members._member_cache.clear()
     yield db, bot, dp, session
     for r in routers:  # роутеры модульные — отцепляем для следующего теста
         r._parent_router = None
@@ -165,7 +190,7 @@ async def test_full_flow(env):
     assert group_msg.reply_markup.inline_keyboard[0][0].style == "success"
     for uid, name in STUDENTS:
         await press(dp, bot, uid, "register", GROUP, name)
-    assert len(db.list_students()) == 3
+    assert len(db.list_students()) == 4  # 3 студента + староста (админ чата)
 
     # отметка + повторное нажатие
     await press(dp, bot, 201, f"mark:{s.id}", GROUP, "Иван Иванов")
@@ -183,7 +208,7 @@ async def test_full_flow(env):
     # карточка занятия у старосты
     await press(dp, bot, ADMIN, f"a:s:{s.id}", ADMIN)
     card = session.of(EditMessageText)[-1].text
-    assert "Были: 2/3" in card and "Анна Смирнова" in card.split("Не было")[1]
+    assert "Были: 2/4" in card and "Анна Смирнова" in card.split("Не было")[1]
 
     # закрытие — нажать больше нельзя
     await press(dp, bot, ADMIN, f"a:sc:{s.id}", ADMIN)
@@ -279,3 +304,180 @@ async def test_click_every_admin_button(env):
     await press(dp, bot, ADMIN, "a:udy:201", ADMIN)
     assert db.get_session(s.id) is None and db.get_student(201) is None
     assert not errors, errors
+
+
+# ---------- новые функции ----------
+
+async def test_protection(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    s = await send_session(bot, db, date.today(), "10:00")
+    assert session.of(SendMessage)[-1].protect_content is True  # запрет пересылки
+
+    # посторонний, не состоящий в чате
+    await press(dp, bot, OUTSIDER, f"mark:{s.id}", GROUP, "Чужой Человек")
+    assert "только участники" in last_alert(session)
+    assert db.get_student(OUTSIDER) is None  # в список не попал
+
+    # нажатие с пересланной копии в другом чате
+    await press(dp, bot, 201, f"mark:{s.id}", -5555, "Иван Иванов")
+    assert "только в чате группы" in last_alert(session)
+    await press(dp, bot, 201, f"mark:{s.id}", 201, "Иван Иванов")
+    assert "только в чате группы" in last_alert(session)
+    assert not db.marks(s.id)
+
+    # исключённый старостой
+    db.upsert_student(202, "Пётр Петров", None)
+    db.set_student_active(202, False)
+    await press(dp, bot, 202, f"mark:{s.id}", GROUP, "Пётр Петров")
+    assert "исключил" in last_alert(session)
+
+    # «только из списка»: новичок не может, студент из списка — может
+    db.set("roster_only", "1")
+    await press(dp, bot, 203, f"mark:{s.id}", GROUP, "Анна Смирнова")
+    assert "нет в списке" in last_alert(session)
+    db.upsert_student(203, "Анна Смирнова", None)
+    await press(dp, bot, 203, f"mark:{s.id}", GROUP, "Анна Смирнова")
+    assert "записано" in last_alert(session)
+
+    # при выключенной проверке членства посторонний пройдёт
+    db.set("roster_only", "0")
+    db.set("members_only", "0")
+    await press(dp, bot, OUTSIDER, f"mark:{s.id}", GROUP, "Чужой Человек")
+    assert "записано" in last_alert(session)
+
+
+async def test_day_mode(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    db.set("mode", "day")
+    first = await send_session(bot, db, date.today(), "09:00", slot="a")
+    assert first is not None and first.time is None
+    assert await send_session(bot, db, date.today(), "13:40", slot="b") is None
+    await press(dp, bot, ADMIN, "a:sendy", ADMIN)
+    assert "уже" in last_alert(session)
+    assert db.count_sessions() == 1
+
+    db.set("mode", "pair")
+    assert await send_session(bot, db, date.today(), "13:40", slot="c") is not None
+
+
+def test_close_modes():
+    db = Database(":memory:", "Europe/Moscow")
+    tz = get_tz(db)
+    start = datetime(2026, 9, 30, 9, 0, tzinfo=tz)
+    db.set("window_minutes", 45)
+    assert compute_close_at(db, start) == start + timedelta(minutes=45)
+    db.set("close_mode", "until")
+    db.set("close_until", "10:30")
+    assert compute_close_at(db, start) == datetime(2026, 9, 30, 10, 30, tzinfo=tz)
+    late = datetime(2026, 9, 30, 11, 0, tzinfo=tz)  # отправили позже 10:30 → до конца дня
+    assert compute_close_at(db, late) == datetime(2026, 9, 30, 23, 59, tzinfo=tz)
+    db.set("close_mode", "eod")
+    assert compute_close_at(db, start) == datetime(2026, 9, 30, 23, 59, tzinfo=tz)
+    db.set("close_mode", "none")
+    assert compute_close_at(db, start) is None
+
+
+async def test_close_setting_applies_to_open_session(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    s = await send_session(bot, db, date.today(), "10:00")
+    await press(dp, bot, ADMIN, "a:setwm:none", ADMIN)
+    assert db.get_session(s.id).close_at is None
+    await press(dp, bot, ADMIN, "a:setwu", ADMIN)
+    await text(dp, bot, ADMIN, "23:58")
+    assert db.get("close_mode") == "until"
+    assert to_hm(db, db.get_session(s.id).close_at) in {"23:58", "23:59"}
+
+
+def to_hm(db, iso):
+    from bot.utils import to_local
+    return f"{to_local(db, iso):%H:%M}"
+
+
+async def test_message_template(env):
+    db, bot, dp, session = env
+    db.set("group_chat_id", GROUP)
+    await press(dp, bot, ADMIN, "a:seti:message_text", ADMIN)
+    await text(dp, bot, ADMIN, "Пара {время}, {день} {дата}. Успей до {до}!")
+    await press(dp, bot, ADMIN, "a:seti:title", ADMIN)
+    await text(dp, bot, ADMIN, "ИВТ-21 <тест>")
+    db.set("close_mode", "until")
+    db.set("close_until", "23:59")
+    await send_session(bot, db, date(2026, 9, 30), "10:00")
+    msg = session.of(SendMessage)[-1].text
+    assert "Пара 10:00, Среда 30.09.2026. Успей до 23:59!" in msg
+    assert "ИВТ-21 &lt;тест&gt;" in msg  # текст экранируется, HTML не ломается
+
+    await press(dp, bot, ADMIN, "a:setpv", ADMIN)
+    assert "Успей до" in session.of(SendMessage)[-1].text
+    await press(dp, bot, ADMIN, "a:setmr", ADMIN)
+    assert db.get("message_text").startswith("📅 {день}")
+
+
+def member_update(chat_id: int, by: int, old: str, new: str, who: User) -> ChatMemberUpdated:
+    cls = {"member": ChatMemberMember, "left": ChatMemberLeft}
+    return ChatMemberUpdated(
+        chat=Chat(id=chat_id, type="supergroup", title="ИВТ-21"),
+        from_user=user(by), date=datetime.now(),
+        old_chat_member=cls[old](user=who), new_chat_member=cls[new](user=who),
+    )
+
+
+async def test_bot_added_auto_binds_and_reads_members(env, monkeypatch):
+    db, bot, dp, session = env
+    object.__setattr__(dp["config"], "api_id", 1)
+    object.__setattr__(dp["config"], "api_hash", "x")
+
+    async def fake_fetch(config, chat_id):
+        return [(ADMIN, "Староста", None), *[(uid, n, None) for uid, n in STUDENTS]]
+
+    monkeypatch.setattr(members, "fetch_all_members", fake_fetch)
+    me = User(id=42, is_bot=True, first_name="bot")
+
+    # добавил посторонний — не привязываемся
+    await dp.feed_update(bot, Update(update_id=next(_uid),
+                                     my_chat_member=member_update(-7, 555, "left", "member", me)))
+    assert db.group_chat_id is None
+
+    # добавил староста — привязка и считывание всех
+    await dp.feed_update(bot, Update(update_id=next(_uid),
+                                     my_chat_member=member_update(GROUP, ADMIN, "left", "member", me)))
+    assert db.group_chat_id == GROUP
+    assert len(db.list_students()) == 4
+    report = [m.text for m in session.of(SendMessage) if m.chat_id == ADMIN][-1]
+    assert "привязан" in report and "<b>4</b>" in report
+
+    # кто-то вышел — после повторной сверки он не считается
+    async def fake_fetch2(config, chat_id):
+        return [(ADMIN, "Староста", None), *[(uid, n, None) for uid, n in STUDENTS[:2]]]
+
+    monkeypatch.setattr(members, "fetch_all_members", fake_fetch2)
+    await press(dp, bot, ADMIN, "a:sync", ADMIN)
+    assert 203 not in {s.user_id for s in db.list_students()}
+    assert db.get_student(203).in_chat is False
+
+
+async def test_member_join_leave_without_api(env):
+    db, bot, dp, session = env
+    await text(dp, bot, ADMIN, "/bind", GROUP, "supergroup")
+    assert db.get_student(ADMIN) is not None  # админы чата добавлены через Bot API
+    report = [m.text for m in session.of(SendMessage) if m.chat_id == ADMIN][-1]
+    assert "API_ID" in report
+
+    newbie = user(301, "Новый Студент")
+    msg = Message(message_id=next(_uid), date=datetime.now(),
+                  chat=Chat(id=GROUP, type="supergroup"), from_user=newbie,
+                  new_chat_members=[newbie])
+    await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
+    assert db.get_student(301).counted
+
+    await text(dp, bot, 302, "всем привет", GROUP, "supergroup")
+    assert db.get_student(302).counted
+
+    msg = Message(message_id=next(_uid), date=datetime.now(),
+                  chat=Chat(id=GROUP, type="supergroup"), from_user=newbie,
+                  left_chat_member=newbie)
+    await dp.feed_update(bot, Update(update_id=next(_uid), message=msg))
+    assert not db.get_student(301).counted
